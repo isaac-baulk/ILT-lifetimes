@@ -282,14 +282,14 @@ def do_alpha_sweep_ILT(input_file, num_elements, lambdas=(np.logspace(-1, np.log
 def exponential_model(t, parameters):
 
     # parameters = [A1, lambda1, A2, lambda2, ...]
-
-    amplitudes = parameters[0::2]
-    rates = parameters[1::2]
+    bg = parameters[0]
+    amplitudes = parameters[1::2]
+    rates = parameters[2::2]
 
     if not len(amplitudes):
-        return np.zeros_like(t)
+        return np.full_like(t, bg)
 
-    return np.exp(-t[:, None] * rates[None, :]) @ amplitudes
+    return bg + np.exp(-t[:, None] * rates[None, :]) @ amplitudes
 
 
 def do_iterative_lasso_ILT(input_file, num_elements, lambdas,

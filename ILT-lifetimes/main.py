@@ -1,13 +1,14 @@
 import chemparse
 import matplotlib.pyplot as plt
 import pandas as pd
+import re
 import numpy as np
 from scipy.optimize import lsq_linear, least_squares # Alex: add this import
 from scipy.signal import find_peaks
 
 from tikhonov_ILT_Alex import load_data
 from L1_ILT_Alex import perform_ILT_lasso, alpha_method_2, optimise_alpha_lasso, plot_optimal, exponential_model
-from utils.isotope_wrapper import parse_formula_isotopes
+from utils.isotope_wrapper import parse_formula_isotopes, ABUNDANCE, lookup_name
 from iterative_ILT import do_iterative_lasso_ILT
 
 # ======================USER CONFIG==========================
@@ -15,6 +16,7 @@ PATH = "data/muon_capture_tables_III_IV.xlsx"
 FORMULA = "LiCl"  # Example formula; replace with the desired chemical formula
 MU_RATE = 0.45516
 BG_FRAC = 0.0001
+DB = {"H", "O", "O-18", "Li-6", "Li-7", "F", "C", "C-13"}
 
 # ===========================================================
 
@@ -27,8 +29,19 @@ def read_and_clean_data():
     
     # 1. drop rows with no mean lifetime
     df = df.dropna(subset=["mean_lifetime_ns"]).reset_index(drop=True)
-    
-    
+
+    #patterndd = re.compile(r"-\d\d", re.IGNORECASE)
+    #patternd = re.compile(r"-\d", re.IGNORECASE)
+    #patternnat = re.compile(r"-nat", re.IGNORECASE)
+    #patterns = [patterndd, patternd, patternnat]
+
+    #pattern = re.compile(r"[A-Za-z]{1,2}-(?:\d{1,2}|nat)")
+
+    #drop specific isotopes
+    df['element'] = df['element'].str.replace(r'-(?:\d{1,2}|nat)', '', regex=True)
+
+    print(df.head())
+
     def calc_avg(g):
         t = g["mean_lifetime_ns"].to_numpy()
         err = g["mean_lifetime_err_ns"].to_numpy()
@@ -75,9 +88,8 @@ def get_element_amplitudes(elements_df, avg_df, df):
     
     return elements_df
 
-
+"""
 def get_element_rates(elements_df, avg_df, df):
-    """Calculate the rate for each element based on its average lifetime"""
     avg_lifetimes = (avg_df.set_index('element').loc[elements_df['element'], 'average_mean_lifetime'].values) / 10**3
     avg_lifetime_errors = (avg_df.set_index('element').loc[elements_df['element'], 'average_mean_lifetime_error'].values) / 10**3
 
@@ -85,6 +97,44 @@ def get_element_rates(elements_df, avg_df, df):
     elements_df['rate_error'] = avg_lifetime_errors / (avg_lifetimes**2)  # Propagate error for rate calculation
 
     return elements_df
+"""
+
+def get_element_rates(elements_df, avg_df, df=None):
+    """Rate (1/us) and rate error for each element, from its average lifetime.
+ 
+    Resolution order for each name in elements_df['element']:
+      1. exact entry in avg_df (measured element or isotope, e.g. 'Ni', 'O-18')
+      2. an isotope missing from avg_df falls back to the plain element ('O-17' -> 'O')
+      3. a plain element with no entry of its own (e.g. 'Li') is built from its
+         isotopes, weighting the RATES by natural abundance (renormalised over
+         the isotopes present in avg_df) and adding the errors in quadrature.
+    `df` is unused; kept so the signature is unchanged.
+    """
+    avg = avg_df.set_index("element")
+    tau = avg["average_mean_lifetime"] / 1e3              # ns -> us
+    tau_err = avg["average_mean_lifetime_error"] / 1e3
+    rate = 1.0 / tau                                      # 1/us
+    rate_err = tau_err / tau**2                           # propagated error
+    available = set(avg.index)
+ 
+    def resolve(name):
+        key = lookup_name(name, available)                # steps 1 and 2
+        if key is not None:
+            return rate[key], rate_err[key]
+        iso = [f"{name}-{a}" for a in ABUNDANCE.get(name, {}) if f"{name}-{a}" in available]
+        if not iso:
+            raise KeyError(f"'{name}' has no entry (element or isotope) in avg_df")
+        w = np.array([ABUNDANCE[name][int(k.split("-")[1])] for k in iso])
+        w /= w.sum()                                      # step 3
+        r = rate[iso].to_numpy()
+        e = rate_err[iso].to_numpy()
+        return float(w @ r), float(np.sqrt(np.sum((w * e) ** 2)))
+ 
+    out = elements_df.copy()
+    resolved = [resolve(n) for n in out["element"]]
+    out["rate"] = [r for r, _ in resolved]
+    out["rate_error"] = [e for _, e in resolved]
+    return out
 
 def generate_synethtic_data(elements_df, avg_df):
     """Generate synthetic data based on the elements' amplitudes and rates."""
@@ -142,37 +192,24 @@ def scale_and_noise(pure_signal_counts, time_points, target_mev):
 
     return noisy_counts, noisy_counts_errors
 
-def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1.5):
+def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=0.3, print_int=False):
     # use a forward modelling approach to iteratively add exponentials to the fit, using L1-regularized ILT to identify the next exponential to add
 
     # Normalize data
     scale_factor = np.max(raw_data)
-
     if scale_factor <= 0:
         raise ValueError("Data have no positive counts to fit")
-
     raw_data_scaled = raw_data / scale_factor
 
     # 1. Create a mask identifying where the loaded errors are zero
     zero_error_mask = (errors == 0)
-
-    # 2. Calculate Poisson fallback errors (enforcing a minimum of 1 count to prevent sqrt(0))
     poisson_fallback = np.sqrt(np.maximum(raw_data, 1.0))
-
-    # 3. Merge the arrays: use Poisson where mask is True, otherwise use raw_errors
     safe_raw_errors = np.where(zero_error_mask, poisson_fallback, errors)
-
-    # 4. Scale the final safe errors to match the scaled raw data
     errors = safe_raw_errors / scale_factor
 
-    # Initially there are no exponential components
-    parameters = np.array([], dtype=float)
-    #errors = np.sqrt(raw_data) / scale_factor
 
-    # Initial residual equals original data
+    parameters = np.array([np.min(raw_data_scaled)], dtype=float)
     current_data = raw_data_scaled.copy()
-
-    # Metric for zero exponentials
     metric_history = [
         np.mean(np.abs(current_data) / errors)
     ]
@@ -193,7 +230,6 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
 
         # STEP 2: Identify the tallest peak in the ILT distribution
         peak_idx = int(np.argmax(ilt_dist))
-
         new_rate = float(lambdas[peak_idx])
         new_amplitude = max(float(ilt_dist[peak_idx]), 1e-9)
 
@@ -201,15 +237,14 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
 
         # STEP 3: Add a new exponential
         initial_guess = np.r_[parameters, new_amplitude, new_rate]
-
-        # Amplitudes >= 0
-        # Relaxation rates between 0 and max(lambdas)
-        lower_bounds = np.tile([0.0, 0.0], iteration + 1)
-
-        upper_bounds = np.tile(
-            [np.inf, float(np.max(lambdas))],
-            iteration + 1
-        )
+        num_params = len(initial_guess)
+        # Lower bounds: 0.0 for background, all amplitudes, and all rates
+        lower_bounds = np.zeros(num_params)
+        
+        # Upper bounds: start with infinity for background and amplitudes
+        upper_bounds = np.full(num_params, np.inf)
+        # Apply the max lambda limit ONLY to the rate parameters (indices 2, 4, 6...)
+        upper_bounds[2::2] = float(np.max(lambdas))
 
         # STEP 4: Globally refit ALL exponentials
         result = least_squares(lambda p: (exponential_model(time_points, p) - raw_data_scaled) / errors,
@@ -227,23 +262,10 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
 
         # Updated parameters for ALL exponentials
         parameters = result.x
-
-        # Global reconstruction
         fit = exponential_model(time_points, parameters)
-
-        # -----------------------------------------------
-        # STEP 5: Calculate the signed residual
-        # -----------------------------------------------
-
         current_data = raw_data_scaled - fit
-
-        # Mean absolute weighted residual
-        mawr = np.mean(
-            np.abs(current_data) / errors
-        )
-
+        mawr = np.mean(np.abs(current_data) / errors)
         metric_history.append(mawr)
-
         print(f"Weighted residual: {mawr:.6f}")
 
         # Calculate Covariance Matrix from the Jacobian
@@ -254,8 +276,11 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
         # integrate under exponential for true amplitude
         print(f"Iteration {iteration + 1} results:")
         for k in range(iteration + 1):
-            A = parameters[2*k]
-            rate = parameters[2*k + 1]
+            A = parameters[2*k + 1]
+            rate = parameters[2*k + 2]
+
+            #integrated amplitude
+            #A = np.trapezoid(A * np.exp(-rate * time_points))
             
             A_err = param_errors[2*k]
             rate_err = param_errors[2*k + 1]
@@ -271,6 +296,7 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
             )
 
         found_components[iteration + 1] = {
+            "mev": mev,
             "amplitude": A,
             "rate": rate
         }
@@ -281,72 +307,74 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
     # -----------------------------------------------
     # STEP 6: Display the results
     # -----------------------------------------------
-    fig, (ax1, ax2, ax3) = plt.subplots(
-        3, 1, figsize=(10, 9)
-    )
-
-    # Experimental data and global fit
-    ax1.plot(
-        time_points, raw_data_scaled,
-        '.', markersize=3,
-        label='Data'
-    )
-
-    ax1.plot(
-        time_points, fit,
-        '-', linewidth=2,
-        label='Global fit'
-    )
-
-    # Show individual exponentials
-    for k in range(iteration):
-
-        A = parameters[2*k]
-        rate = parameters[2*k + 1]
-
-        component = A * np.exp(-rate * time_points)
-
-        ax1.plot(
-            time_points, component,
-            '--', alpha=0.7,
-            label=f'Exponential {k+1}'
+    if print_int:
+        fig, (ax1, ax2, ax3) = plt.subplots(
+            3, 1, figsize=(10, 9)
         )
 
-    ax1.set_xlabel('Time')
-    ax1.set_ylabel('Scaled counts')
-    ax1.set_title(
-        f'Fit with {iteration + 1} exponentials'
-    )
-    ax1.legend()
+        # Experimental data and global fit
+        ax1.plot(
+            time_points, raw_data_scaled,
+            '.', markersize=3,
+            label='Data'
+        )
 
-    # Signed residual
-    ax2.axhline(0, color='black', linewidth=0.8)
-    ax2.plot(time_points, current_data, '.', markersize=3)
+        ax1.plot(
+            time_points, fit,
+            '-', linewidth=2,
+            label='Global fit'
+        )
 
-    ax2.set_xlabel('Time')
-    ax2.set_ylabel('Data - Fit')
-    ax2.set_title(f'Residual: MAWR = {mawr:.4f}')
+        # Show individual exponentials
+        for k in range(iteration):
 
-    # ILT distribution used to initialize this iteration
-    ax3.plot(
-        lambdas, ilt_dist,
-        label='ILT of previous residual'
-    )
+            A = parameters[2*k]
+            rate = parameters[2*k + 1]
 
-    ax3.plot(
-        new_rate,
-        ilt_dist[peak_idx],
-        'ro',
-        label='Selected peak'
-    )
+            component = A * np.exp(-rate * time_points)
 
-    ax3.set_xlabel('Relaxation rate')
-    ax3.set_xscale('symlog', linthresh=0.01)
-    ax3.set_ylabel('ILT amplitude')
-    ax3.legend()
+            ax1.plot(
+                time_points, component,
+                '--', alpha=0.7,
+                label=f'Exponential {k+1}'
+            )
 
-    plt.tight_layout()
-    plt.show()
+        ax1.set_xlabel('Time')
+        ax1.set_ylabel('Scaled counts')
+        ax1.set_title(
+            f'Fit with {iteration + 1} exponentials'
+        )
+        ax1.legend()
+
+        # Signed residual
+        ax2.axhline(0, color='black', linewidth=0.8)
+        ax2.plot(time_points, current_data, '.', markersize=3)
+
+        ax2.set_xlabel('Time')
+        ax2.set_ylabel('Data - Fit')
+        ax2.set_title(f'Residual: MAWR = {mawr:.4f}')
+
+        # ILT distribution used to initialize this iteration
+        ax3.plot(
+            lambdas, ilt_dist,
+            label='ILT of previous residual'
+        )
+
+        ax3.plot(
+            new_rate,
+            ilt_dist[peak_idx],
+            'ro',
+            label='Selected peak'
+        )
+
+        ax3.set_xlabel('Relaxation rate')
+        ax3.set_xscale('symlog', linthresh=0.01)
+        ax3.set_ylabel('ILT amplitude')
+        ax3.legend()
+
+        plt.tight_layout()
+        plt.title(f'ILT at {mev} MEv')
+        plt.show()
 
     return found_components, np.asarray(metric_history)
 
@@ -358,28 +386,31 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, lambdas, target_mawr=1
 
 def sweep_mev(pure_signal_counts, time_points):
     """Sweep through a range of MeV values, generate synthetic data, and run the iterative ILT."""
-    mev_values = np.linspace(1, 10.0, 2)  # Example range from 0.1 to 10 MeV
+    mev_values = np.linspace(1, 50, 5)  # Example range from 0.1 to 10 MeV
     results = []
 
     for mev in mev_values:
-        print(f"Processing {mev:.2f} MeV...")
+        print(f"Processing {mev:.2f} MeV... \n")
+        print("-----------------------------")
         noisy_counts, errors = scale_and_noise(pure_signal_counts, time_points, mev)
         
         # Run the iterative ILT on the noisy data
-        found_components, _ = do_iterative_lasso_ILT(time_points, noisy_counts, errors, lambdas=np.linspace(0, 5, 200), target_mawr=2.0)
+        found_components, _ = do_iterative_lasso_ILT(time_points, noisy_counts, errors, mev,
+                                                     lambdas=np.linspace(0, 5, 200), target_mawr=2.0,
+                                                     print_int=False)
         
         # Store results for analysis
-        results.append({
-            'mev': mev,
-            'found_components': found_components,
-        })
+        results.append(found_components)
+
 
     return results
 
 
 def main():
-    parsed_forumula = parse_formula_isotopes(FORMULA)
-    elements_df = pd.DataFrame(list(parsed_forumula.items()), columns=['element', 'count'])
+    #parsed_formula = parse_formula_isotopes(FORMULA, available=DB)
+    parsed_formula = chemparse.parse_formula(FORMULA)
+    print(parsed_formula)
+    elements_df = pd.DataFrame(list(parsed_formula.items()), columns=['element', 'count'])
     df, avg_df = read_and_clean_data()
     elements_df = get_element_amplitudes(elements_df, avg_df, df)
     elements_df = get_element_rates(elements_df, avg_df, df)
@@ -393,11 +424,19 @@ def main():
 
     # run sim
     results = sweep_mev(pure_signal_counts, time_points)
-    print("Simulation completed. Results:")
-    for result in results:  
-        print(f"MeV: {result['mev']:.2f}, Found Components: {result['found_components']}")  
+    flattened_data = []
+    for run in results:
+        for comp_id, data in run.items():
+            flattened_data.append({
+                'MEv': float(data['mev']),
+                'Component': comp_id,
+                'Amplitude': float(data['amplitude']),
+                'Rate': float(data['rate'])
+            })
 
+    df_results = pd.DataFrame(flattened_data)
 
-
+    print("\nSimulation completed. Results:")
+    print(df_results.to_string(index=False, float_format="%.4f"))
 
 main()

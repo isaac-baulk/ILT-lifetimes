@@ -11,6 +11,7 @@ Isotope notation accepted in the formula (all give Li-6 here):
                                     read as isotope 2 of O)
 """
 import re
+import warnings
 from chemparse import parse_formula
 
 # natural isotopic abundances (atom fractions, IUPAC/NIST), only for elements
@@ -36,12 +37,17 @@ _ISO = re.compile(
 _PLACEHOLDERS = [f"X{c}" for c in "abcdefghijklmnopqrstuvwxyz"]
 
 
-def parse_formula_isotopes(formula, split_natural=True):
+def parse_formula_isotopes(formula, split_natural=True, available=None):
     """Return {'Li-6': n, 'F': n, ...} of atom counts.
 
     Isotopes written in the formula keep their label. With split_natural=True,
     plain elements that appear in ABUNDANCE are split into isotopes by natural
     abundance (e.g. 'Li': 1 -> 'Li-6': 0.0759, 'Li-7': 0.9241).
+
+    available: optional collection of names present in the database (e.g.
+    set(df['element'])). Any isotope not in it is defaulted to the plain
+    element if that exists (O-17 -> 'O'), and counts are merged. Isotopes
+    with neither an isotope nor an element entry are kept and a warning is raised.
     """
     mapping = {}  # placeholder -> 'Li-6'
 
@@ -74,6 +80,17 @@ def parse_formula_isotopes(formula, split_natural=True):
                 out[key] = out.get(key, 0) + n * frac
         else:
             out[sym] = out.get(sym, 0) + n
+
+    if available is not None:
+        available = set(available)
+        resolved = {}
+        for key, n in out.items():
+            name = lookup_name(key, available)
+            if name is None:
+                warnings.warn(f"{key} has no isotope or element entry in the database")
+                name = key
+            resolved[name] = resolved.get(name, 0) + n
+        out = resolved
     return out
 
 
@@ -94,3 +111,6 @@ if __name__ == "__main__":
     print(parse_formula_isotopes("[6Li]F"))     # pure Li-6
     print(parse_formula_isotopes("Li-7(OH)"))   # pure Li-7
     print(parse_formula_isotopes("H2O"))        # no ambiguity with bare digits
+    db = {"H", "O", "O-18", "Li-6", "Li-7", "F", "C", "C-13"}
+    print(parse_formula_isotopes("Li2CO3", available=db))  # O-16/O-17 -> 'O'
+    print(parse_formula_isotopes("H2O", available=db))     # O + O-18
