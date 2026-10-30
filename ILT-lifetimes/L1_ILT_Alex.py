@@ -291,6 +291,29 @@ def exponential_model(t, parameters):
 
     return bg + np.exp(-t[:, None] * rates[None, :]) @ amplitudes
 
+def exponential_jacobian(t, parameters):
+    amplitudes = parameters[1::2]
+    rates = parameters[2::2]
+    
+    # Initialize the Jacobian matrix: shape (num_time_points, num_parameters)
+    J = np.zeros((len(t), len(parameters)))
+    
+    # Derivative with respect to the background (parameters[0]) is always 1
+    J[:, 0] = 1.0
+    
+    if not len(amplitudes):
+        return J
+        
+    # Precompute the decay curves
+    decay = np.exp(-t[:, None] * rates[None, :])
+    
+    # Derivative with respect to Amplitudes (A) = exp(-rate * t)
+    J[:, 1::2] = decay
+    
+    # Derivative with respect to Rates (lambda) = -A * t * exp(-rate * t)
+    J[:, 2::2] = -amplitudes[None, :] * t[:, None] * decay
+    
+    return J
 
 def do_iterative_lasso_ILT(input_file, num_elements, lambdas,
                            target_mawr=None):

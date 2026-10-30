@@ -7,13 +7,13 @@ from scipy.optimize import lsq_linear, least_squares # Alex: add this import
 from scipy.signal import find_peaks
 
 from tikhonov_ILT_Alex import load_data
-from L1_ILT_Alex import perform_ILT_lasso, alpha_method_2, optimise_alpha_lasso, plot_optimal, exponential_model
+from L1_ILT_Alex import optimise_alpha_lasso, plot_optimal, exponential_jacobian, exponential_model
 from utils.isotope_wrapper import parse_formula_isotopes, ABUNDANCE, lookup_name
 from iterative_ILT import do_iterative_lasso_ILT
 
 # ======================USER CONFIG==========================
 PATH = "data/muon_capture_tables_III_IV.xlsx"
-FORMULA = "LiCl"  # Example formula; replace with the desired chemical formula
+FORMULA = "CaCO3"  # Example formula; replace with the desired chemical formula
 MU_RATE = 0.45516
 BG_FRAC = 0.0001
 DB = {"H", "O", "O-18", "Li-6", "Li-7", "F", "C", "C-13"}
@@ -88,8 +88,8 @@ def get_element_amplitudes(elements_df, avg_df, df):
     
     return elements_df
 
-"""
-def get_element_rates(elements_df, avg_df, df):
+
+def get_element_rates_old(elements_df, avg_df, df):
     avg_lifetimes = (avg_df.set_index('element').loc[elements_df['element'], 'average_mean_lifetime'].values) / 10**3
     avg_lifetime_errors = (avg_df.set_index('element').loc[elements_df['element'], 'average_mean_lifetime_error'].values) / 10**3
 
@@ -97,7 +97,6 @@ def get_element_rates(elements_df, avg_df, df):
     elements_df['rate_error'] = avg_lifetime_errors / (avg_lifetimes**2)  # Propagate error for rate calculation
 
     return elements_df
-"""
 
 def get_element_rates(elements_df, avg_df, df=None):
     """Rate (1/us) and rate error for each element, from its average lifetime.
@@ -153,7 +152,7 @@ def generate_synethtic_data(elements_df, avg_df):
         rate = row['rate']
         
         # Generate synthetic data points (e.g., using an exponential decay model)
-        time_points = np.linspace(0, 15, 100)  # Example time points from 0 to 15 μs
+        time_points = np.linspace(0, 15, 2000)  # Example time points from 0 to 15 μs
         decay_curve = amplitude * np.exp(-rate * time_points)
         
         synthetic_data.append({
@@ -177,6 +176,43 @@ def plot_synthetic_data(synthetic_data, pure_signal_counts, time_points):
     plt.grid()
     plt.show()
 
+def generate_dynamic_grids(elements_df):
+    """
+    Creates time and lambda grids scaled exactly to the physical rates of the compound.
+    Slashes array sizes to massively speed up the ILT lasso solver.
+    """
+    rates = elements_df['rate'].values
+    min_rate = np.min(rates)
+    max_rate = np.max(rates)
+    
+    # --- 1. Dynamic Time Grid ---
+    # Must be fast enough to resolve the shortest lifetime (min 15 points per decay)
+    tau_min = 1.0 / max_rate
+    dt = tau_min / 15.0
+    
+    # Must be long enough to see the longest lifetime die out (approx 5 lifetimes)
+    # Capped at 15-20us since muons completely decay away by then anyway
+    tau_max = 1.0 / min_rate
+    t_max = min(5.0 * tau_max, 16.0) 
+    
+    n_points = int(t_max / dt)
+    # Keep array size within sensible bounds for matrix math
+    n_points = np.clip(n_points, 100, 1500)
+    time_points = np.linspace(0, t_max, n_points)
+    
+    # --- 2. Dynamic Lambda Grid ---
+    # Bound the search space tightly around the known theoretical extremes (+/- 50%)
+    l_min = max(0.01, min_rate * 0.5)
+    l_max = max_rate * 1.5
+    
+    # Because the bounds are now tight, 150 points provides massive resolution 
+    # while keeping the Lasso inversion lightning fast.
+    lambdas = np.linspace(l_min, l_max, 150)
+    
+    print(f"Dynamic Grids -> Time: {n_points} points | Lambdas: {l_min:.2f} to {l_max:.2f}")
+    
+    return time_points, lambdas
+
 def scale_and_noise(pure_signal_counts, time_points, target_mev):
     """Scale the pure signal counts to a target MeV and add Gaussian noise."""
     target_mev *= 1e6
@@ -192,7 +228,7 @@ def scale_and_noise(pure_signal_counts, time_points, target_mev):
 
     return noisy_counts, noisy_counts_errors
 
-def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=0.3, print_int=False):
+def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=1.0, print_int=False):
     # use a forward modelling approach to iteratively add exponentials to the fit, using L1-regularized ILT to identify the next exponential to add
 
     # Normalize data
@@ -216,7 +252,7 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
 
     found_components = {}
     iteration = 0
-    print(f'Iteration {iteration}: MAWR = {metric_history[-1]:.6f}')
+    print(f'NEW RUN: MAWR = {metric_history[-1]:.6f}')
     while metric_history[-1] > target_mawr:
 
         print(f"\n--- Iteration {iteration + 1} ---")
@@ -233,8 +269,6 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         new_rate = float(lambdas[peak_idx])
         new_amplitude = max(float(ilt_dist[peak_idx]), 1e-9)
 
-        print(f"Tallest ILT peak: lambda = {new_rate:.5f}")
-
         # STEP 3: Add a new exponential
         initial_guess = np.r_[parameters, new_amplitude, new_rate]
         num_params = len(initial_guess)
@@ -247,16 +281,20 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         upper_bounds[2::2] = float(np.max(lambdas))
 
         # STEP 4: Globally refit ALL exponentials
-        result = least_squares(lambda p: (exponential_model(time_points, p) - raw_data_scaled) / errors,
-
+        result = least_squares(
+            # The objective function
+            lambda p: (exponential_model(time_points, p) - raw_data_scaled) / errors,
+            
+            # The analytical Jacobian (divided by errors to match the objective)
+            jac=lambda p: exponential_jacobian(time_points, p) / errors[:, None],
+            
             x0=initial_guess,
-
-            bounds=(
-                lower_bounds,
-                upper_bounds
-            ),
-
-            x_scale='jac',
+            bounds=(lower_bounds, upper_bounds),
+            
+            # Relax tolerances to stop wasting time on statistical noise
+            ftol=1e-5,
+            xtol=1e-5,
+            
             max_nfev=10000
         )
 
@@ -274,7 +312,8 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         param_errors = np.sqrt(np.diag(cov))
 
         # integrate under exponential for true amplitude
-        print(f"Iteration {iteration + 1} results:")
+        #print(f"Iteration {iteration + 1} results:")
+        found_components = {}
         for k in range(iteration + 1):
             A = parameters[2*k + 1]
             rate = parameters[2*k + 2]
@@ -288,18 +327,23 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
             tau = 1.0 / rate if rate > 0 else np.inf
             tau_err = (1.0 / rate**2) * rate_err if rate > 0 else 0.0
 
+            
             print(
                 f"Component {k+1}: \n"
                 f"  A      = {A:.6f} +/- {A_err:.6f}\n"
                 f"  lambda = {rate:.6f} +/- {rate_err:.6f} us^-1\n"
                 f"  tau    = {tau*1e3:.3f} +/- {tau_err*1e3:.3f} ns"
             )
+            
 
-        found_components[iteration + 1] = {
-            "mev": mev,
-            "amplitude": A,
-            "rate": rate
-        }
+            found_components[k + 1] = {
+                "mev": mev,
+                "amplitude": A,
+                "amplitude err": A_err,
+                "rate": rate,
+                "rate err": rate_err,
+                "lifetime": tau,
+            }
 
         iteration += 1
 
@@ -381,62 +425,120 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
 
 
 
-
-
-
-def sweep_mev(pure_signal_counts, time_points):
-    """Sweep through a range of MeV values, generate synthetic data, and run the iterative ILT."""
-    mev_values = np.linspace(1, 50, 5)  # Example range from 0.1 to 10 MeV
-    results = []
-
-    for mev in mev_values:
-        print(f"Processing {mev:.2f} MeV... \n")
-        print("-----------------------------")
+def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df, target_mawr=1.05):
+    """
+    Sweeps MEv up to a strict limit of 50.0. 
+    Maps found rates to theoretical elements to determine if they are resolved or grouped.
+    """
+    mev_steps = [1.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0]
+    
+    print("\n--- Determining Required MEv for Resolution ---")
+    
+    for mev in mev_steps:
+        print(f"\nTesting {mev:.1f} MEv... ==================================")
         noisy_counts, errors = scale_and_noise(pure_signal_counts, time_points, mev)
         
-        # Run the iterative ILT on the noisy data
-        found_components, _ = do_iterative_lasso_ILT(time_points, noisy_counts, errors, mev,
-                                                     lambdas=np.linspace(0, 5, 200), target_mawr=2.0,
-                                                     print_int=False)
+        # Run the iterative ILT solver
+        found_components, _ = do_iterative_lasso_ILT(
+            time_points, noisy_counts, errors, mev,
+            lambdas=np.linspace(0.1, 15.0, 500), 
+            target_mawr=target_mawr,
+        )
         
-        # Store results for analysis
-        results.append(found_components)
+        found_rates = [data['rate'] for data in found_components.values()]
+        
+        if not found_rates:
+            print("Solver failed to find components.")
+            continue
+            
+        # Map each theoretical element to the closest rate found by the solver
+        groupings = {fr: [] for fr in found_rates}
+        for _, row in elements_df.iterrows():
+            closest_rate = min(found_rates, key=lambda x: abs(x - row['rate']))
+            groupings[closest_rate].append(row['element'])
+        
+        # Check if any found component is forced to represent multiple theoretical elements
+        has_grouped_factor = any(len(elements) > 1 for elements in groupings.values())
+        
+        if not has_grouped_factor:
+            print(f"\nSUCCESS: All elements cleanly separated at {mev:.1f} MEv.")
+            for fr, elements in groupings.items():
+                if elements:
+                    print(f"  {elements[0]} isolated at rate = {fr:.4f} us^-1")
+            return mev, found_components
 
+    # If the loop finishes without returning, the 50 MEv limit was reached
+    print("\nLIMIT REACHED: Solver cannot fully separate components at 50.0 MEv.")
+    print("The following components are definitively Grouped Factors:")
+    for fr, elements in groupings.items():
+        if len(elements) > 1:
+            print(f"  -> GROUPED FACTOR: {', '.join(elements)} (Effective Rate: {fr:.4f} us^-1)")
+        elif len(elements) == 1:
+            print(f"  -> Separated: {elements[0]} (Rate: {fr:.4f} us^-1)")
+            
+    return 50.0, found_components
 
-    return results
-
+def check_resolution_limits(elements_df, resolution_ratio=1.15):
+    """
+    Checks if theoretical decay rates are too close to be resolved by the solver
+    and predicts the amplitude-weighted grouped rates.
+    """
+    print("\n--- Theoretical Resolution Check ---")
+    
+    # Sort elements by rate to compare neighbors
+    df = elements_df.sort_values(by='rate').reset_index(drop=True)
+    
+    groups = []
+    current_group = [df.iloc[0]]
+    
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        # Compare current element's rate to the previous element's rate
+        if row['rate'] / current_group[-1]['rate'] < resolution_ratio:
+            current_group.append(row)
+        else:
+            groups.append(current_group)
+            current_group = [row]
+    groups.append(current_group)
+    
+    # Calculate and print predictions for each group
+    for group in groups:
+        elements = [r['element'] for r in group]
+        total_amp = sum(r['amplitude'] for r in group)
+        
+        # The solver will find the amplitude-weighted average rate
+        eff_rate = sum(r['amplitude'] * r['rate'] for r in group) / total_amp
+        
+        if len(group) > 1:
+            print(f"WARNING: Unresolvable components -> {', '.join(elements)}")
+            print(f"  These rates are too similar and will merge.")
+            print(f"  Predicted solver result: Amplitude = {total_amp:.4f} | Rate = {eff_rate:.4f} us^-1\n")
+        else:
+            print(f"Clean separation expected -> {elements[0]}")
+            print(f"  Predicted solver result: Amplitude = {total_amp:.4f} | Rate = {eff_rate:.4f} us^-1\n")
+            
+    print("------------------------------------\n")
 
 def main():
     #parsed_formula = parse_formula_isotopes(FORMULA, available=DB)
     parsed_formula = chemparse.parse_formula(FORMULA)
-    print(parsed_formula)
     elements_df = pd.DataFrame(list(parsed_formula.items()), columns=['element', 'count'])
     df, avg_df = read_and_clean_data()
     elements_df = get_element_amplitudes(elements_df, avg_df, df)
     elements_df = get_element_rates(elements_df, avg_df, df)
 
-    print("Elements DataFrame with Amplitudes and Rates:")
-    print(elements_df)
-
+    time_points, lambdas = generate_dynamic_grids(elements_df)
     pure_signal_counts, synthetic_data, time_points = generate_synethtic_data(elements_df, avg_df)
 
-    #plot_synthetic_data(synthetic_data, pure_signal_counts, time_points)
+    plot_synthetic_data(synthetic_data, pure_signal_counts, time_points)
 
     # run sim
-    results = sweep_mev(pure_signal_counts, time_points)
-    flattened_data = []
-    for run in results:
-        for comp_id, data in run.items():
-            flattened_data.append({
-                'MEv': float(data['mev']),
-                'Component': comp_id,
-                'Amplitude': float(data['amplitude']),
-                'Rate': float(data['rate'])
-            })
-
-    df_results = pd.DataFrame(flattened_data)
-
-    print("\nSimulation completed. Results:")
-    print(df_results.to_string(index=False, float_format="%.4f"))
+    required_mev, final_components = determine_required_mev(
+        pure_signal_counts, 
+        time_points,
+        lambdas, 
+        elements_df, 
+        target_mawr=0.8  # Lower threshold to force the solver to try splitting elements
+    )
 
 main()
