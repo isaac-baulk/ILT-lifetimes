@@ -12,8 +12,8 @@ from utils.isotope_wrapper import parse_formula_isotopes, ABUNDANCE, lookup_name
 from iterative_ILT import do_iterative_lasso_ILT
 
 # ======================USER CONFIG==========================
-PATH = "data/muon_capture_tables_III_IV.xlsx"
-FORMULA = "CaCO3"  # Example formula; replace with the desired chemical formula
+DF_PATH = "data/muon_capture_tables_III_IV.xlsx"
+FORMULA = "LiAlSi2O6"  # Example formula; replace with the desired chemical formula
 MU_RATE = 0.45516
 BG_FRAC = 0.0001
 DB = {"H", "O", "O-18", "Li-6", "Li-7", "F", "C", "C-13"}
@@ -24,7 +24,7 @@ DB = {"H", "O", "O-18", "Li-6", "Li-7", "F", "C", "C-13"}
 def read_and_clean_data(): 
     """Read the Excel file, clean the data, and compute averages for elements with multiple entries."""
     # --- load, lower-case the column names ---
-    df = pd.read_excel(PATH)
+    df = pd.read_excel(DF_PATH)
     df.columns = df.columns.str.lower()
     
     # 1. drop rows with no mean lifetime
@@ -40,7 +40,7 @@ def read_and_clean_data():
     #drop specific isotopes
     df['element'] = df['element'].str.replace(r'-(?:\d{1,2}|nat)', '', regex=True)
 
-    print(df.head())
+    df['rate'] = 1.0 / (df['mean_lifetime_ns'] / 1e3)  # Convert ns to μs for rate calculation
 
     def calc_avg(g):
         t = g["mean_lifetime_ns"].to_numpy()
@@ -228,7 +228,7 @@ def scale_and_noise(pure_signal_counts, time_points, target_mev):
 
     return noisy_counts, noisy_counts_errors
 
-def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=1.0, print_int=False):
+def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=1.5, print_int=False):
     # use a forward modelling approach to iteratively add exponentials to the fit, using L1-regularized ILT to identify the next exponential to add
 
     # Normalize data
@@ -252,16 +252,16 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
 
     found_components = {}
     iteration = 0
-    print(f'NEW RUN: MAWR = {metric_history[-1]:.6f}')
-    while metric_history[-1] > target_mawr:
+    #print(f'NEW RUN: MAWR = {metric_history[-1]:.6f}')
+    while metric_history[-1] > target_mawr and iteration < 10:
 
-        print(f"\n--- Iteration {iteration + 1} ---")
+        #print(f"\n--- Iteration {iteration + 1} ---")
 
         # STEP 1: Perform ILT on the current residual
         _, optimal_alpha, _, ilt_dist, _ = optimise_alpha_lasso(current_data, time_points, lambdas)
 
         if np.max(ilt_dist) <= 1e-12:
-            print("No positive ILT peak left. Stopping.")
+            #print("No positive ILT peak left. Stopping.")
             break
 
         # STEP 2: Identify the tallest peak in the ILT distribution
@@ -304,7 +304,7 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         current_data = raw_data_scaled - fit
         mawr = np.mean(np.abs(current_data) / errors)
         metric_history.append(mawr)
-        print(f"Weighted residual: {mawr:.6f}")
+        #print(f"Weighted residual: {mawr:.6f}")
 
         # Calculate Covariance Matrix from the Jacobian
         # Use pseudo-inverse (pinv) to prevent crashes if the matrix is nearly singular
@@ -327,14 +327,14 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
             tau = 1.0 / rate if rate > 0 else np.inf
             tau_err = (1.0 / rate**2) * rate_err if rate > 0 else 0.0
 
-            
+            """
             print(
                 f"Component {k+1}: \n"
                 f"  A      = {A:.6f} +/- {A_err:.6f}\n"
                 f"  lambda = {rate:.6f} +/- {rate_err:.6f} us^-1\n"
                 f"  tau    = {tau*1e3:.3f} +/- {tau_err*1e3:.3f} ns"
             )
-            
+            """
 
             found_components[k + 1] = {
                 "mev": mev,
@@ -441,7 +441,7 @@ def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df
         # Run the iterative ILT solver
         found_components, _ = do_iterative_lasso_ILT(
             time_points, noisy_counts, errors, mev,
-            lambdas=np.linspace(0.1, 15.0, 500), 
+            lambdas=lambdas,
             target_mawr=target_mawr,
         )
         
@@ -464,7 +464,8 @@ def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df
             print(f"\nSUCCESS: All elements cleanly separated at {mev:.1f} MEv.")
             for fr, elements in groupings.items():
                 if elements:
-                    print(f"  {elements[0]} isolated at rate = {fr:.4f} us^-1")
+                    print(f"  {elements[0]} isolated at rate = {fr:.4f} us^-1 and lifetime = {(1.0 / fr) * 10e2 if fr > 0 else np.inf:.2f} us")
+                    print(f"  {elements[0]} isolated at rate = {fr:.4f} us^-1 and lifetime = {lifetime:.2f} us")
             return mev, found_components
 
     # If the loop finishes without returning, the 50 MEv limit was reached
@@ -473,6 +474,8 @@ def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df
     for fr, elements in groupings.items():
         if len(elements) > 1:
             print(f"  -> GROUPED FACTOR: {', '.join(elements)} (Effective Rate: {fr:.4f} us^-1)")
+            lifetime = (1.0 / fr) * 10e2 if fr > 0 else np.inf
+            print(f"    Predicted lifetime: {lifetime:.2f} us")
         elif len(elements) == 1:
             print(f"  -> Separated: {elements[0]} (Rate: {fr:.4f} us^-1)")
             
@@ -519,7 +522,29 @@ def check_resolution_limits(elements_df, resolution_ratio=1.15):
             
     print("------------------------------------\n")
 
-def main():
+def compare_to_true_lifetimes(found_components, elements_df):
+    """
+    Compares the found components to the theoretical lifetimes and prints a summary.
+    """
+    print("\n--- Comparison to Theoretical Lifetimes ---")
+    
+    for comp_id, comp_data in found_components.items():
+        found_rate = comp_data['rate']
+        found_lifetime = (1.0 / found_rate) * 10e2 if found_rate > 0 else np.inf
+        
+        # Find the closest theoretical element
+        closest_element = min(elements_df.itertuples(), key=lambda x: abs(x.rate - found_rate))
+        closest_lifetime = (1.0 / closest_element.rate) * 10e2 if closest_element.rate > 0 else np.inf
+        
+        print(f"Component {comp_id}:")
+        print(f"  Found Rate: {found_rate:.4f} us^-1 | Found Lifetime: {found_lifetime:.2f} us")
+        print(f"  Closest Theoretical Element: {closest_element.element}")
+        print(f"  Theoretical Lifetime: {closest_lifetime:.2f} us\n")
+        print(f"Percentage Difference in Lifetime: {abs(found_lifetime - closest_lifetime) / closest_lifetime * 100:.2f}%\n")
+    
+    print("-------------------------------------------\n")
+
+def find_required_res():
     #parsed_formula = parse_formula_isotopes(FORMULA, available=DB)
     parsed_formula = chemparse.parse_formula(FORMULA)
     elements_df = pd.DataFrame(list(parsed_formula.items()), columns=['element', 'count'])
@@ -541,4 +566,25 @@ def main():
         target_mawr=0.8  # Lower threshold to force the solver to try splitting elements
     )
 
-main()
+    compare_to_true_lifetimes(final_components, elements_df)
+
+def perform_ILT_on_unknown(PATH, lambdas, mev):
+    time_points, raw_data, errors = load_data(PATH)
+    df, avg_df = read_and_clean_data()
+
+    found_components, metric_history = do_iterative_lasso_ILT(
+        time_points, raw_data, errors, mev=10.0,
+        lambdas=lambdas,
+        target_mawr=1.5,
+        print_int=False
+    )
+
+    compare_to_true_lifetimes(found_components, df)  # No theoretical data for unknown
+
+
+if __name__ == "__main__":
+    #find_required_res()
+    PATH = "data/mantid/81259-bwd-counts.dat"  # Replace with the actual path to your unknown data file
+    LAMBDAS = np.linspace(0.01, 10.0, 250)  # Adjust the lambda grid as needed
+    MEV = 10.0
+    perform_ILT_on_unknown(PATH, LAMBDAS, MEV)
