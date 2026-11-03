@@ -163,7 +163,7 @@ def generate_synethtic_data(elements_df, avg_df):
     pure_signal_counts = BG_FRAC + np.sum([d['decay_curve'] for d in synthetic_data], axis=0)
     return pure_signal_counts, synthetic_data, time_points
 
-def plot_synthetic_data(synthetic_data, pure_signal_counts, time_points):
+def plot_data(synthetic_data, pure_signal_counts, time_points):
     """Plot the synthetic decay curves and the pure signal counts."""
     plt.figure(figsize=(10, 6))
     for data in synthetic_data:
@@ -252,10 +252,7 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
 
     found_components = {}
     iteration = 0
-    #print(f'NEW RUN: MAWR = {metric_history[-1]:.6f}')
     while metric_history[-1] > target_mawr and iteration < 10:
-
-        #print(f"\n--- Iteration {iteration + 1} ---")
 
         # STEP 1: Perform ILT on the current residual
         _, optimal_alpha, _, ilt_dist, _ = optimise_alpha_lasso(current_data, time_points, lambdas)
@@ -304,15 +301,12 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         current_data = raw_data_scaled - fit
         mawr = np.mean(np.abs(current_data) / errors)
         metric_history.append(mawr)
-        #print(f"Weighted residual: {mawr:.6f}")
 
-        # Calculate Covariance Matrix from the Jacobian
+        # Calculate Covariance Matrix from the Jacobian for errors
         # Use pseudo-inverse (pinv) to prevent crashes if the matrix is nearly singular
         cov = np.linalg.pinv(result.jac.T @ result.jac)
         param_errors = np.sqrt(np.diag(cov))
 
-        # integrate under exponential for true amplitude
-        #print(f"Iteration {iteration + 1} results:")
         found_components = {}
         for k in range(iteration + 1):
             A = parameters[2*k + 1]
@@ -327,15 +321,6 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
             tau = 1.0 / rate if rate > 0 else np.inf
             tau_err = (1.0 / rate**2) * rate_err if rate > 0 else 0.0
 
-            """
-            print(
-                f"Component {k+1}: \n"
-                f"  A      = {A:.6f} +/- {A_err:.6f}\n"
-                f"  lambda = {rate:.6f} +/- {rate_err:.6f} us^-1\n"
-                f"  tau    = {tau*1e3:.3f} +/- {tau_err*1e3:.3f} ns"
-            )
-            """
-
             found_components[k + 1] = {
                 "mev": mev,
                 "amplitude": A,
@@ -343,6 +328,7 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
                 "rate": rate,
                 "rate err": rate_err,
                 "lifetime": tau,
+                "lifetime err": tau_err
             }
 
         iteration += 1
@@ -530,17 +516,23 @@ def compare_to_true_lifetimes(found_components, elements_df):
     
     for comp_id, comp_data in found_components.items():
         found_rate = comp_data['rate']
-        found_lifetime = (1.0 / found_rate) * 10e2 if found_rate > 0 else np.inf
+        found_lifetime = comp_data['lifetime'] * 1e3  # Convert to ns for comparison
         
         # Find the closest theoretical element
         closest_element = min(elements_df.itertuples(), key=lambda x: abs(x.rate - found_rate))
         closest_lifetime = (1.0 / closest_element.rate) * 10e2 if closest_element.rate > 0 else np.inf
         
         print(f"Component {comp_id}:")
-        print(f"  Found Rate: {found_rate:.4f} us^-1 | Found Lifetime: {found_lifetime:.2f} us")
+        print(f"  Found Rate: {found_rate:.4f} us^-1 +- {comp_data['rate err']:.4f} us^-1")
+        print(f"  Found Lifetime: {found_lifetime:.2f} us +- {comp_data['lifetime err']:.2f} us")
         print(f"  Closest Theoretical Element: {closest_element.element}")
         print(f"  Theoretical Lifetime: {closest_lifetime:.2f} us\n")
         print(f"Percentage Difference in Lifetime: {abs(found_lifetime - closest_lifetime) / closest_lifetime * 100:.2f}%\n")
+        print(f"Other elements in error range:")
+        for other_element in elements_df.itertuples():
+            other_lifetime = (1.0 / other_element.rate) * 10e2 if other_element.rate > 0 else np.inf
+            if abs(found_lifetime - other_lifetime) <= comp_data['lifetime err']:
+                print(f"  - {other_element.element}: Theoretical Lifetime = {other_lifetime:.2f} us")
     
     print("-------------------------------------------\n")
 
@@ -555,7 +547,7 @@ def find_required_res():
     time_points, lambdas = generate_dynamic_grids(elements_df)
     pure_signal_counts, synthetic_data, time_points = generate_synethtic_data(elements_df, avg_df)
 
-    plot_synthetic_data(synthetic_data, pure_signal_counts, time_points)
+    plot_data(synthetic_data, pure_signal_counts, time_points)
 
     # run sim
     required_mev, final_components = determine_required_mev(
@@ -572,19 +564,34 @@ def perform_ILT_on_unknown(PATH, lambdas, mev):
     time_points, raw_data, errors = load_data(PATH)
     df, avg_df = read_and_clean_data()
 
+    ev = np.sum(raw_data)
+    mev = ev / 1e6
+
     found_components, metric_history = do_iterative_lasso_ILT(
-        time_points, raw_data, errors, mev=10.0,
+        time_points, raw_data, errors, mev=mev,
         lambdas=lambdas,
         target_mawr=1.5,
         print_int=False
     )
 
+    #reconstruct the decay curves for each found component
+    reconstructions = []
+    for comp_id, comp_data in found_components.items():
+        reconstructions.append(
+            {'element': comp_id,
+            'decay_curve': comp_data['amplitude'] * np.exp(-comp_data['rate'] * time_points) * np.max(raw_data)}
+            )
+
+
+    plot_data(reconstructions, raw_data, time_points)  # Plot the raw data and reconstructed curves
+
     compare_to_true_lifetimes(found_components, df)  # No theoretical data for unknown
+    
 
 
 if __name__ == "__main__":
     #find_required_res()
-    PATH = "data/mantid/81259-bwd-counts.dat"  # Replace with the actual path to your unknown data file
+    PATH = "data/mantid/81799-bwd-counts.dat"  # Replace with the actual path to your unknown data file
     LAMBDAS = np.linspace(0.01, 10.0, 250)  # Adjust the lambda grid as needed
     MEV = 10.0
     perform_ILT_on_unknown(PATH, LAMBDAS, MEV)
