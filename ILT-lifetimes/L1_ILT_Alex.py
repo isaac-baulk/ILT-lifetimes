@@ -10,6 +10,40 @@ from sklearn.exceptions import ConvergenceWarning
 # Suppress warnings if the solver hits the iteration limit on heavily penalized steps
 warnings.filterwarnings("ignore", category=ConvergenceWarning)
 
+
+def _continuous_peak_rate(distribution, candidate_index, lambdas):
+    """Estimate a peak rate continuously from its local L1 distribution."""
+    left = max(0, candidate_index - 2)
+    right = min(len(distribution), candidate_index + 3)
+    x = np.asarray(lambdas[left:right], dtype=float)
+    y = np.asarray(distribution[left:right], dtype=float)
+
+    baseline = np.min(y)
+    weights = np.maximum(y - baseline, 0.0)
+    weight_sum = np.sum(weights)
+    if weight_sum > 0:
+        weighted_rate = float(np.sum(x * weights) / weight_sum)
+    else:
+        weighted_rate = float(lambdas[candidate_index])
+
+    if 0 < candidate_index < len(distribution) - 1:
+        quadratic = np.polyfit(
+            lambdas[candidate_index - 1:candidate_index + 2],
+            distribution[candidate_index - 1:candidate_index + 2],
+            2,
+        )
+        if np.isfinite(quadratic).all() and quadratic[0] < 0:
+            vertex = -quadratic[1] / (2.0 * quadratic[0])
+            if (
+                np.isfinite(vertex)
+                and lambdas[candidate_index - 1] <= vertex
+                <= lambdas[candidate_index + 1]
+            ):
+                return float(vertex)
+
+    return weighted_rate
+
+
 def load_data(path):
     data = np.loadtxt(path, comments="#", usecols=(0, 1), ndmin=2) 
     t = data[:, 0] 
@@ -142,17 +176,37 @@ def optimise_alpha_lasso(raw_data, t, lambdas, plot_lcurve=False):
 
     return lambdas, optimal_alpha, optimal_reconstruction, optimal_dist, K
 
-def alpha_sweep_lasso(raw_data, lambdas, K, optimal_alpha, sweep_factor=3.0, steps=20):
-    sweep_alphas = np.logspace(np.log10(optimal_alpha / sweep_factor), 
-                               np.log10(optimal_alpha * sweep_factor), steps)
+def alpha_sweep_lasso(raw_data, lambdas, K, optimal_alpha, sweep_factor=3.0, steps=30):
+    if optimal_alpha <= 0:
+        return np.empty((0, len(lambdas)))
+
+    if steps < 2:
+        raise ValueError("Alpha sweep requires at least two samples")
+
+    if sweep_factor <= 1:
+        raise ValueError("Alpha sweep factor must be greater than one")
+
+    if not np.isfinite(optimal_alpha):
+        raise ValueError("Optimal alpha must be finite")
+
+    # Sample symmetrically in log space around the selected optimum.
+    sweep_alphas = np.logspace(
+        np.log10(optimal_alpha / sweep_factor),
+        np.log10(optimal_alpha * sweep_factor),
+        steps,
+    )
+    if not np.all(np.isfinite(sweep_alphas)):
+        return np.empty((0, len(lambdas)))
     
     sweep_distributions = []
-    print(f"Running Alpha Sweep over {steps} values (from {sweep_alphas[0]:.2e} to {sweep_alphas[-1]:.2e})...")
+    #print(
+    #    f"Running Alpha Sweep over {len(sweep_alphas)} values "
+    #    f"(from {sweep_alphas[0]:.2e} to {sweep_alphas[-1]:.2e})..."
+    #)
     
     for alpha in sweep_alphas:
-        # Call the new lasso function (Gamma and padded d are gone)
         dist = perform_ILT_lasso(alpha, K, raw_data)
-        dist_rates = dist[:-1] 
+        dist_rates = dist
         
         area = np.trapezoid(dist_rates, lambdas)
         if area > 0:
@@ -162,23 +216,44 @@ def alpha_sweep_lasso(raw_data, lambdas, K, optimal_alpha, sweep_factor=3.0, ste
         
     return np.array(sweep_distributions)
 
-def track_elemental_peaks_sweep(optimal_dist, lambdas, sweep_distributions, num_elements):
-    peaks, _ = find_peaks(optimal_dist, prominence=0.01, distance=12)
-    
-    if len(peaks) == 0:
-        print("No significant peaks found in the distribution.")
-        return None
-        
-    peak_heights = optimal_dist[peaks]
-    sorted_indices = np.argsort(peak_heights)[::-1]
-    top_peaks = np.sort(peaks[sorted_indices][:num_elements])
+def track_elemental_peaks_sweep(
+    optimal_dist,
+    lambdas,
+    sweep_distributions,
+    num_elements,
+    amplitude_fitter=None,
+    reference_rates=None,
+):
+    if reference_rates is None:
+        peaks, _ = find_peaks(optimal_dist, prominence=0.01, distance=12)
+
+        if len(peaks) == 0:
+            peaks = np.array([int(np.argmax(optimal_dist))])
+
+        peak_heights = optimal_dist[peaks]
+        sorted_indices = np.argsort(peak_heights)[::-1]
+        top_peaks = np.sort(peaks[sorted_indices][:num_elements])
+    else:
+        reference_rates = np.asarray(reference_rates, dtype=float)
+        if len(reference_rates) != num_elements:
+            raise ValueError("reference_rates must match num_elements")
+        top_peaks = np.asarray(
+            [int(np.abs(lambdas - rate).argmin()) for rate in reference_rates]
+        )
     
     results = []
-    
+
+    tracked_rate_samples = []
     for i, peak_idx in enumerate(top_peaks):
-        optimal_rate = lambdas[peak_idx]
+        optimal_rate = (
+            float(reference_rates[i])
+            if reference_rates is not None
+            else float(lambdas[peak_idx])
+        )
         
-        window_mask = (lambdas > optimal_rate / 1.5) & (lambdas < optimal_rate * 1.5)
+        window_mask = (lambdas >= optimal_rate * 0.5) & (
+            lambdas <= optimal_rate * 1.5
+        )
         tracked_rates = []
         
         for dist in sweep_distributions:
@@ -187,13 +262,40 @@ def track_elemental_peaks_sweep(optimal_dist, lambdas, sweep_distributions, num_
             
             if len(window_dist) > 0:
                 local_max_idx = np.argmax(window_dist)
-                tracked_rates.append(window_lambdas[local_max_idx])
+                grid_idx = np.flatnonzero(window_mask)[local_max_idx]
+                tracked_rates.append(
+                    _continuous_peak_rate(dist, grid_idx, lambdas)
+                )
             
-        rates = np.array(tracked_rates)
-        
-        # Because this is deterministic, we use absolute min and max shifts, not percentiles
+        tracked_rate_samples.append(np.asarray(tracked_rates, dtype=float))
+
+    amplitude_samples = None
+    if amplitude_fitter is not None and len(sweep_distributions):
+        amplitude_samples = np.asarray(
+            amplitude_fitter(np.asarray(tracked_rate_samples, dtype=float).T)
+        )
+
+    results = []
+    for i, peak_idx in enumerate(top_peaks):
+        optimal_rate = (
+            float(reference_rates[i])
+            if reference_rates is not None
+            else float(lambdas[peak_idx])
+        )
+        rates = tracked_rate_samples[i]
+        if not len(rates):
+            rates = np.array([optimal_rate])
+
         rate_min = np.min(rates)
         rate_max = np.max(rates)
+        rate_std = float(np.std(rates, ddof=1)) if len(rates) > 1 else 0.0
+
+        amplitude_std = 0.0
+        if amplitude_samples is not None and amplitude_samples.ndim == 2:
+            samples = amplitude_samples[:, i]
+            amplitude_std = (
+                float(np.std(samples, ddof=1)) if len(samples) > 1 else 0.0
+            )
         
         tau_opt = 1.0 / optimal_rate
         tau_min = 1.0 / rate_max # highest rate = shortest lifetime
@@ -203,16 +305,95 @@ def track_elemental_peaks_sweep(optimal_dist, lambdas, sweep_distributions, num_
             'rate_opt': optimal_rate,
             'rate_err_plus': rate_max - optimal_rate,
             'rate_err_minus': optimal_rate - rate_min,
+            'rate_std': rate_std,
+            'amplitude_std': amplitude_std,
             'tau_opt': tau_opt,
             'tau_err_plus': tau_max - tau_opt,
             'tau_err_minus': tau_opt - tau_min
         })
-        
+        """
         print(f"--- Element Peak (~{optimal_rate:.2f} us^-1) ---")
         print(f"Rate:     {optimal_rate:.3f} +{rate_max - optimal_rate:.3f} -{optimal_rate - rate_min:.3f} us^-1")
         print(f"Lifetime: {tau_opt*1e3:.3f} +{(tau_max - tau_opt)*1e3:.3f} -{(tau_opt - tau_min)*1e3:.3f} ns\n")
-        
+        """
     return results
+
+
+def noise_bostrapping(
+    raw_data,
+    lambdas,
+    K,
+    optimal_alpha,
+    noise_sigma,
+    num_samples=100,
+    amplitude_fitter=None,
+    random_state=None,
+    reference_rate=None,
+    window_fraction=0.5,
+    fit_data=None,
+    rate_fitter=None,
+):
+    """Estimate ILT rate and amplitude uncertainty by perturbing the data."""
+    rng = np.random.default_rng(random_state)
+    rates = []
+    amplitudes = []
+
+    for _ in range(num_samples):
+        noise = rng.normal(0.0, noise_sigma, size=raw_data.shape)
+        perturbed_data = raw_data + noise
+        perturbed_fit_data = fit_data + noise if fit_data is not None else perturbed_data
+        dist = perform_ILT_lasso(optimal_alpha, K, perturbed_data)
+        if reference_rate is None:
+            window_mask = np.ones(len(lambdas), dtype=bool)
+        else:
+            window_mask = (
+                (lambdas >= reference_rate * (1.0 - window_fraction))
+                & (lambdas <= reference_rate * (1.0 + window_fraction))
+            )
+            if not np.any(window_mask):
+                raise ValueError("Bootstrap rate window does not overlap lambdas")
+
+        window_indices = np.flatnonzero(window_mask)
+        window_dist = dist[window_mask]
+        peaks, _ = find_peaks(
+            window_dist,
+            prominence=max(float(np.max(window_dist)), 1.0e-12) * 0.05,
+            distance=1,
+        )
+        if len(peaks) == 0:
+            peak = window_indices[int(np.argmax(window_dist))]
+        else:
+            peak = window_indices[peaks[np.argmax(window_dist[peaks])]]
+        peak_rate = _continuous_peak_rate(dist, peak, lambdas)
+        if reference_rate is not None:
+            window_min = reference_rate * (1.0 - window_fraction)
+            window_max = reference_rate * (1.0 + window_fraction)
+            peak_rate = float(np.clip(peak_rate, window_min, window_max))
+        if rate_fitter is not None:
+            fitted_rates = np.asarray(
+                rate_fitter(np.asarray([[peak_rate]]), perturbed_fit_data)
+            )
+            peak_rate = float(fitted_rates[0, 0])
+            if reference_rate is not None:
+                peak_rate = float(np.clip(peak_rate, window_min, window_max))
+        rates.append(peak_rate)
+
+        if amplitude_fitter is not None:
+            fitted = np.asarray(
+                amplitude_fitter(np.asarray([[peak_rate]]), perturbed_fit_data)
+            )
+            amplitudes.append(float(fitted[0, 0]))
+        else:
+            amplitudes.append(float(dist[peak]))
+
+    return {
+        "rate_std": float(np.std(rates, ddof=1)) if len(rates) > 1 else 0.0,
+        "amplitude_std": (
+            float(np.std(amplitudes, ddof=1)) if len(amplitudes) > 1 else 0.0
+        ),
+        "rates": np.asarray(rates),
+        "amplitudes": np.asarray(amplitudes),
+    }
 
 def plot_optimal(t, raw_data, lambdas, optimal_reconstruction, optimal_dist, element_data=None):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4)) 
@@ -261,16 +442,19 @@ def do_alpha_sweep_ILT(input_file, num_elements, lambdas=(np.logspace(-1, np.log
     scale_factor = np.max(raw_data)
     raw_data = raw_data / scale_factor
     
-    lambdas, optimal_alpha, optimal_reconstruction, optimal_dist, K, Gamma = optimise_alpha_lasso(raw_data, t, lambdas)
+    lambdas, optimal_alpha, optimal_reconstruction, optimal_dist, K = optimise_alpha_lasso(
+        raw_data, t, lambdas
+    )
     print(f"\nInitial Optimal alpha value: {optimal_alpha:.6e}") 
     
     # 2. Normalize the initial distribution
     area = np.trapezoid(optimal_dist, lambdas)
     optimal_dist_norm = optimal_dist / area
     
-    # 3. Run the deterministic Alpha Sweep
-    # sweep_factor=3.0 tests alphas from optimal/3 to optimal*3. 
-    sweep_distributions = alpha_sweep_lasso(raw_data, lambdas, K, Gamma, optimal_alpha, sweep_factor=3.0, steps=20)
+    # 3. Run the deterministic sweep over the top 5% of the alpha grid.
+    sweep_distributions = alpha_sweep_lasso(
+        raw_data, lambdas, K, optimal_alpha, sweep_factor=3.0, steps=20
+    )
 
     # 4. Extract peaks and track them across the sweep distributions
     element_data = track_elemental_peaks_sweep(optimal_dist_norm, lambdas, sweep_distributions, num_elements=num_elements)

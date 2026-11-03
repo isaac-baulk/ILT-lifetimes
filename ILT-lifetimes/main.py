@@ -7,7 +7,15 @@ from scipy.optimize import lsq_linear, least_squares # Alex: add this import
 from scipy.signal import find_peaks
 
 from tikhonov_ILT_Alex import load_data
-from L1_ILT_Alex import optimise_alpha_lasso, plot_optimal, exponential_jacobian, exponential_model
+from L1_ILT_Alex import (
+    alpha_sweep_lasso,
+    noise_bostrapping,
+    optimise_alpha_lasso,
+    plot_optimal,
+    exponential_jacobian,
+    exponential_model,
+    track_elemental_peaks_sweep,
+)
 from utils.isotope_wrapper import parse_formula_isotopes, ABUNDANCE, lookup_name
 from iterative_ILT import do_iterative_lasso_ILT
 
@@ -30,13 +38,6 @@ def read_and_clean_data():
     # 1. drop rows with no mean lifetime
     df = df.dropna(subset=["mean_lifetime_ns"]).reset_index(drop=True)
 
-    #patterndd = re.compile(r"-\d\d", re.IGNORECASE)
-    #patternd = re.compile(r"-\d", re.IGNORECASE)
-    #patternnat = re.compile(r"-nat", re.IGNORECASE)
-    #patterns = [patterndd, patternd, patternnat]
-
-    #pattern = re.compile(r"[A-Za-z]{1,2}-(?:\d{1,2}|nat)")
-
     #drop specific isotopes
     df['element'] = df['element'].str.replace(r'-(?:\d{1,2}|nat)', '', regex=True)
 
@@ -54,6 +55,8 @@ def read_and_clean_data():
             {
                 "average_mean_lifetime": mean,
                 "average_mean_lifetime_error": mean_err,
+                "rate": 1.0 / (mean / 1e3),  # Convert ns to μs for rate calculation
+                "rate_error": mean_err / (mean**2 / 1e6),
                 "n_entries": len(t),
             }
         )
@@ -69,7 +72,7 @@ def read_and_clean_data():
 
 
 def get_element_amplitudes(elements_df, avg_df, df):
-    """Calculate the amplitude for each element based on its count and atomic number."""
+    """Calculate the amplitude for each element based on its count and atomic number (Fermi-Teller law)."""
     # 1. Validate that all elements exist in avg_df
     missing_elements = set(elements_df['element']) - set(avg_df['element'])
     if missing_elements:
@@ -253,9 +256,12 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
     found_components = {}
     iteration = 0
     while metric_history[-1] > target_mawr and iteration < 10:
-
+        print(f'Beginning next iteration. Fitting {iteration + 1} exponentials')
         # STEP 1: Perform ILT on the current residual
-        _, optimal_alpha, _, ilt_dist, _ = optimise_alpha_lasso(current_data, time_points, lambdas)
+        ilt_input = current_data.copy()
+        _, optimal_alpha, _, ilt_dist, _ = optimise_alpha_lasso(
+            ilt_input, time_points, lambdas
+        )
 
         if np.max(ilt_dist) <= 1e-12:
             #print("No positive ILT peak left. Stopping.")
@@ -302,8 +308,46 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         mawr = np.mean(np.abs(current_data) / errors)
         metric_history.append(mawr)
 
-        # Calculate Covariance Matrix from the Jacobian for errors
-        # Use pseudo-inverse (pinv) to prevent crashes if the matrix is nearly singular
+        def fit_amplitudes(component_index, rate_samples, data=raw_data_scaled):
+            fitted_amplitudes = []
+            for candidate_rates in np.asarray(rate_samples):
+                initial = parameters.copy()
+                initial[2 * component_index + 2] = candidate_rates[-1]
+                upper = np.full(len(initial), np.inf)
+                upper[2::2] = np.max(lambdas)
+                bounds = (np.zeros(len(initial)), upper)
+                fitted = least_squares(
+                    lambda p: (exponential_model(time_points, p) - data) / errors,
+                    x0=initial,
+                    bounds=bounds,
+                    max_nfev=10000,
+                )
+                fitted_amplitudes.append([fitted.x[2 * component_index + 1]])
+            return np.asarray(fitted_amplitudes)
+
+        def fit_rates(component_index, rate_samples, data=raw_data_scaled):
+            fitted_rates = []
+            for candidate_rates in np.asarray(rate_samples):
+                initial = parameters.copy()
+                initial[2 * component_index + 2] = candidate_rates[-1]
+                upper = np.full(len(initial), np.inf)
+                upper[2::2] = np.max(lambdas)
+                fitted = least_squares(
+                    lambda p: (exponential_model(time_points, p) - data) / errors,
+                    x0=initial,
+                    bounds=(np.zeros(len(initial)), upper),
+                    max_nfev=10000,
+                )
+                fitted_rates.append([fitted.x[2 * component_index + 2]])
+            return np.asarray(fitted_rates)
+
+        sweep_distributions = alpha_sweep_lasso(
+            ilt_input,
+            lambdas,
+            np.exp(-lambdas[None, :] * time_points[:, None]),
+            optimal_alpha,
+        )
+        # Combine covariance, ILT-sweep, and noise-bootstrap uncertainties.
         cov = np.linalg.pinv(result.jac.T @ result.jac)
         param_errors = np.sqrt(np.diag(cov))
 
@@ -312,14 +356,57 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
             A = parameters[2*k + 1]
             rate = parameters[2*k + 2]
 
+            sweep_data = track_elemental_peaks_sweep(
+                ilt_dist,
+                lambdas,
+                sweep_distributions,
+                num_elements=1,
+                amplitude_fitter=lambda rates, index=k: fit_amplitudes(
+                    index, rates
+                ),
+                reference_rates=[rate],
+            )
+            bootstrap = noise_bostrapping(
+                ilt_input,
+                lambdas,
+                np.exp(-lambdas[None, :] * time_points[:, None]),
+                optimal_alpha,
+                errors,
+                amplitude_fitter=lambda rates, data, index=k: fit_amplitudes(
+                    index, rates, data
+                ),
+                reference_rate=rate,
+                window_fraction=0.5,
+                fit_data=raw_data_scaled,
+                rate_fitter=lambda rates, data, index=k: fit_rates(
+                    index, rates, data
+                ),
+            )
+            alpha_rate_std = sweep_data[0]["rate_std"] if sweep_data else 0.0
+            alpha_amplitude_std = (
+                sweep_data[0]["amplitude_std"] if sweep_data else 0.0
+            )
+
             #integrated amplitude
             #A = np.trapezoid(A * np.exp(-rate * time_points))
             
-            A_err = param_errors[2*k]
-            rate_err = param_errors[2*k + 1]
+            A_err = np.hypot(alpha_amplitude_std, bootstrap["amplitude_std"])
+            rate_err = np.hypot(alpha_rate_std, bootstrap["rate_std"])
+
+            print(f"Component {k+1}: rate = {rate:.4f}, alpha_err = {alpha_rate_std:.4f}, bootstrap_err = {bootstrap['rate_std']:.4f}")
+
             
             tau = 1.0 / rate if rate > 0 else np.inf
-            tau_err = (1.0 / rate**2) * rate_err if rate > 0 else 0.0
+            if rate > 0:
+                tau_upper = (
+                    1.0 / (rate - rate_err)
+                    if rate > rate_err
+                    else np.inf
+                )
+                tau_lower = 1.0 / (rate + rate_err)
+                tau_err = max(tau_upper - tau, tau - tau_lower)
+            else:
+                tau_err = 0.0
 
             found_components[k + 1] = {
                 "mev": mev,
@@ -408,7 +495,9 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
 
     return found_components, np.asarray(metric_history)
 
-
+def determine_stoichemtry(elements_df):
+    """Determine stoichiometry of compound based on amplitudes of components found by the ILT solver."""
+    pass
 
 
 def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df, target_mawr=1.05):
@@ -517,6 +606,7 @@ def compare_to_true_lifetimes(found_components, elements_df):
     for comp_id, comp_data in found_components.items():
         found_rate = comp_data['rate']
         found_lifetime = comp_data['lifetime'] * 1e3  # Convert to ns for comparison
+        lifetime_error = comp_data['lifetime err'] * 1e3
         
         # Find the closest theoretical element
         closest_element = min(elements_df.itertuples(), key=lambda x: abs(x.rate - found_rate))
@@ -524,14 +614,14 @@ def compare_to_true_lifetimes(found_components, elements_df):
         
         print(f"Component {comp_id}:")
         print(f"  Found Rate: {found_rate:.4f} us^-1 +- {comp_data['rate err']:.4f} us^-1")
-        print(f"  Found Lifetime: {found_lifetime:.2f} us +- {comp_data['lifetime err']:.2f} us")
+        print(f"  Found Lifetime: {found_lifetime:.2f} ns +- {lifetime_error:.2f} ns")
         print(f"  Closest Theoretical Element: {closest_element.element}")
         print(f"  Theoretical Lifetime: {closest_lifetime:.2f} us\n")
         print(f"Percentage Difference in Lifetime: {abs(found_lifetime - closest_lifetime) / closest_lifetime * 100:.2f}%\n")
         print(f"Other elements in error range:")
         for other_element in elements_df.itertuples():
             other_lifetime = (1.0 / other_element.rate) * 10e2 if other_element.rate > 0 else np.inf
-            if abs(found_lifetime - other_lifetime) <= comp_data['lifetime err']:
+            if abs(found_lifetime - other_lifetime) <= lifetime_error:
                 print(f"  - {other_element.element}: Theoretical Lifetime = {other_lifetime:.2f} us")
     
     print("-------------------------------------------\n")
@@ -585,7 +675,7 @@ def perform_ILT_on_unknown(PATH, lambdas, mev):
 
     plot_data(reconstructions, raw_data, time_points)  # Plot the raw data and reconstructed curves
 
-    compare_to_true_lifetimes(found_components, df)  # No theoretical data for unknown
+    compare_to_true_lifetimes(found_components, avg_df)  # No theoretical data for unknown
     
 
 
