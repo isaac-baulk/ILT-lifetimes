@@ -7,11 +7,10 @@ from scipy.optimize import lsq_linear, least_squares # Alex: add this import
 from scipy.signal import find_peaks
 
 from tikhonov_ILT_Alex import load_data
-from L1_ILT_Alex import (
+from L1_ILT_new import (
     alpha_sweep_lasso,
-    noise_bostrapping,
+    bootstrap_fit_parameters,
     optimise_alpha_lasso,
-    plot_optimal,
     exponential_jacobian,
     exponential_model,
     track_elemental_peaks_sweep,
@@ -231,7 +230,87 @@ def scale_and_noise(pure_signal_counts, time_points, target_mev):
 
     return noisy_counts, noisy_counts_errors
 
-def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=1.5, print_int=False):
+def fit_amplitudes_fixed_rates(t, data, errors, rate_samples):
+    """Refit background + amplitudes with the rates HELD FIXED at each sample row.
+
+    rate_samples: (n_samples, n_components). Returns (n_samples, n_components)
+    amplitudes. Holding the rates fixed is what lets a shift in the tracked ILT
+    peak position propagate into the amplitude (letting them float just walks
+    back to the same least-squares minimum every time).
+    """
+    w = 1.0 / np.asarray(errors, dtype=float)
+    out = []
+    for rates in np.atleast_2d(rate_samples):
+        X = np.column_stack([np.ones_like(t), np.exp(-t[:, None] * np.asarray(rates)[None, :])])
+        sol = lsq_linear(X * w[:, None], data * w, bounds=(0.0, np.inf)).x
+        out.append(sol[1:])
+    return np.asarray(out)
+
+
+def estimate_component_uncertainties(t, data, errors, parameters, lambdas, jac=None,
+                                     mev=None, num_bootstrap=200, seed=0):
+    """Alpha-sweep (systematic) + bootstrap (statistical) errors on the FINAL model.
+
+    parameters = [bg, A1, r1, A2, r2, ...] from the converged global fit.
+    """
+    parameters = np.asarray(parameters, dtype=float)
+    n_comp = (len(parameters) - 1) // 2
+    if n_comp == 0:
+        return {}
+    bg, amps, rates = parameters[0], parameters[1::2], parameters[2::2]
+
+    # --- systematic: alpha sweep on data that still contains ALL components ---
+    ilt_data = data - bg
+    _, alpha_opt, _, ilt_dist, K = optimise_alpha_lasso(ilt_data, t, lambdas)
+    sweep = alpha_sweep_lasso(ilt_data, lambdas, K, alpha_opt)
+    sweep_res = track_elemental_peaks_sweep(
+        ilt_dist, lambdas, sweep, num_elements=n_comp,
+        reference_rates=rates,
+        amplitude_fitter=lambda r: fit_amplitudes_fixed_rates(t, data, errors, r),
+    )
+
+    # --- statistical: parametric bootstrap of the global fit ---
+    boot = bootstrap_fit_parameters(
+        t, parameters, errors, upper_rate=float(np.max(lambdas)),
+        num_samples=num_bootstrap, random_state=seed,
+    )
+
+    # --- optional cross-check: covariance of the least-squares fit ---
+    cov_std = np.full(len(parameters), np.nan)
+    if jac is not None:
+        cov_std = np.sqrt(np.abs(np.diag(np.linalg.pinv(jac.T @ jac))))
+
+    comps = {}
+    for k in range(n_comp):
+        a_rate = sweep_res[k]["rate_std"]
+        a_amp = sweep_res[k]["amplitude_std"]
+        b_rate = boot["std"][2 + 2 * k]
+        b_amp = boot["std"][1 + 2 * k]
+        # an unresolved alpha systematic is reported as such, not as zero
+        rate_err = float(np.hypot(0.0 if np.isnan(a_rate) else a_rate, b_rate))
+        A_err = float(np.hypot(0.0 if np.isnan(a_amp) else a_amp, b_amp))
+        rate = rates[k]
+        print(f"Component {k+1}: rate = {rate:.4f} | alpha_err = {a_rate:.3e} "
+              f"(valid {sweep_res[k]['n_valid']}/{sweep_res[k]['n_total']}) | "
+              f"bootstrap_err = {b_rate:.3e} | covariance_err = {cov_std[2 + 2 * k]:.3e}")
+
+        if rate > 0:
+            tau = 1.0 / rate
+            tau_upper = 1.0 / (rate - rate_err) if rate > rate_err else np.inf
+            tau_lower = 1.0 / (rate + rate_err)
+            tau_err = max(tau_upper - tau, tau - tau_lower)
+        else:
+            tau, tau_err = np.inf, 0.0
+
+        comps[k + 1] = {
+            "mev": mev, "amplitude": amps[k], "amplitude err": A_err,
+            "rate": rate, "rate err": rate_err,
+            "lifetime": tau, "lifetime err": tau_err,
+            "alpha rate err": a_rate, "bootstrap rate err": b_rate,
+        }
+    return comps
+
+def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=1.5, print_int=False, force_comps=None):
     # use a forward modelling approach to iteratively add exponentials to the fit, using L1-regularized ILT to identify the next exponential to add
 
     # Normalize data
@@ -254,8 +333,10 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
     ]
 
     found_components = {}
+    last_jac = None
     iteration = 0
-    while metric_history[-1] > target_mawr and iteration < 10:
+
+    while (metric_history[-1] > target_mawr and iteration < 10) or (force_comps is not None and iteration < force_comps):
         print(f'Beginning next iteration. Fitting {iteration + 1} exponentials')
         # STEP 1: Perform ILT on the current residual
         ilt_input = current_data.copy()
@@ -308,117 +389,14 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         mawr = np.mean(np.abs(current_data) / errors)
         metric_history.append(mawr)
 
-        def fit_amplitudes(component_index, rate_samples, data=raw_data_scaled):
-            fitted_amplitudes = []
-            for candidate_rates in np.asarray(rate_samples):
-                initial = parameters.copy()
-                initial[2 * component_index + 2] = candidate_rates[-1]
-                upper = np.full(len(initial), np.inf)
-                upper[2::2] = np.max(lambdas)
-                bounds = (np.zeros(len(initial)), upper)
-                fitted = least_squares(
-                    lambda p: (exponential_model(time_points, p) - data) / errors,
-                    x0=initial,
-                    bounds=bounds,
-                    max_nfev=10000,
-                )
-                fitted_amplitudes.append([fitted.x[2 * component_index + 1]])
-            return np.asarray(fitted_amplitudes)
-
-        def fit_rates(component_index, rate_samples, data=raw_data_scaled):
-            fitted_rates = []
-            for candidate_rates in np.asarray(rate_samples):
-                initial = parameters.copy()
-                initial[2 * component_index + 2] = candidate_rates[-1]
-                upper = np.full(len(initial), np.inf)
-                upper[2::2] = np.max(lambdas)
-                fitted = least_squares(
-                    lambda p: (exponential_model(time_points, p) - data) / errors,
-                    x0=initial,
-                    bounds=(np.zeros(len(initial)), upper),
-                    max_nfev=10000,
-                )
-                fitted_rates.append([fitted.x[2 * component_index + 2]])
-            return np.asarray(fitted_rates)
-
-        sweep_distributions = alpha_sweep_lasso(
-            ilt_input,
-            lambdas,
-            np.exp(-lambdas[None, :] * time_points[:, None]),
-            optimal_alpha,
-        )
-        # Combine covariance, ILT-sweep, and noise-bootstrap uncertainties.
-        cov = np.linalg.pinv(result.jac.T @ result.jac)
-        param_errors = np.sqrt(np.diag(cov))
-
-        found_components = {}
-        for k in range(iteration + 1):
-            A = parameters[2*k + 1]
-            rate = parameters[2*k + 2]
-
-            sweep_data = track_elemental_peaks_sweep(
-                ilt_dist,
-                lambdas,
-                sweep_distributions,
-                num_elements=1,
-                amplitude_fitter=lambda rates, index=k: fit_amplitudes(
-                    index, rates
-                ),
-                reference_rates=[rate],
-            )
-            bootstrap = noise_bostrapping(
-                ilt_input,
-                lambdas,
-                np.exp(-lambdas[None, :] * time_points[:, None]),
-                optimal_alpha,
-                errors,
-                amplitude_fitter=lambda rates, data, index=k: fit_amplitudes(
-                    index, rates, data
-                ),
-                reference_rate=rate,
-                window_fraction=0.5,
-                fit_data=raw_data_scaled,
-                rate_fitter=lambda rates, data, index=k: fit_rates(
-                    index, rates, data
-                ),
-            )
-            alpha_rate_std = sweep_data[0]["rate_std"] if sweep_data else 0.0
-            alpha_amplitude_std = (
-                sweep_data[0]["amplitude_std"] if sweep_data else 0.0
-            )
-
-            #integrated amplitude
-            #A = np.trapezoid(A * np.exp(-rate * time_points))
-            
-            A_err = np.hypot(alpha_amplitude_std, bootstrap["amplitude_std"])
-            rate_err = np.hypot(alpha_rate_std, bootstrap["rate_std"])
-
-            print(f"Component {k+1}: rate = {rate:.4f}, alpha_err = {alpha_rate_std:.4f}, bootstrap_err = {bootstrap['rate_std']:.4f}")
-
-            
-            tau = 1.0 / rate if rate > 0 else np.inf
-            if rate > 0:
-                tau_upper = (
-                    1.0 / (rate - rate_err)
-                    if rate > rate_err
-                    else np.inf
-                )
-                tau_lower = 1.0 / (rate + rate_err)
-                tau_err = max(tau_upper - tau, tau - tau_lower)
-            else:
-                tau_err = 0.0
-
-            found_components[k + 1] = {
-                "mev": mev,
-                "amplitude": A,
-                "amplitude err": A_err,
-                "rate": rate,
-                "rate err": rate_err,
-                "lifetime": tau,
-                "lifetime err": tau_err
-            }
+        last_jac = result.jac
 
         iteration += 1
+
+    found_components = estimate_component_uncertainties(
+        time_points, raw_data_scaled, errors, parameters, lambdas,
+        jac=last_jac if iteration > 0 else None, mev=mev,
+    )
 
 
     # -----------------------------------------------
@@ -500,7 +478,7 @@ def determine_stoichemtry(elements_df):
     pass
 
 
-def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df, target_mawr=1.05):
+def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df, target_mawr=0.8):
     """
     Sweeps MEv up to a strict limit of 50.0. 
     Maps found rates to theoretical elements to determine if they are resolved or grouped.
@@ -650,7 +628,7 @@ def find_required_res():
 
     compare_to_true_lifetimes(final_components, elements_df)
 
-def perform_ILT_on_unknown(PATH, lambdas, mev):
+def perform_ILT_on_unknown(PATH, lambdas, force_comps=None):
     time_points, raw_data, errors = load_data(PATH)
     df, avg_df = read_and_clean_data()
 
@@ -661,7 +639,8 @@ def perform_ILT_on_unknown(PATH, lambdas, mev):
         time_points, raw_data, errors, mev=mev,
         lambdas=lambdas,
         target_mawr=1.5,
-        print_int=False
+        print_int=False,
+        force_comps=force_comps
     )
 
     #reconstruct the decay curves for each found component
@@ -683,5 +662,7 @@ if __name__ == "__main__":
     #find_required_res()
     PATH = "data/mantid/81799-bwd-counts.dat"  # Replace with the actual path to your unknown data file
     LAMBDAS = np.linspace(0.01, 10.0, 250)  # Adjust the lambda grid as needed
-    MEV = 10.0
-    perform_ILT_on_unknown(PATH, LAMBDAS, MEV)
+    FORCE_COMPS = 2
+
+
+    perform_ILT_on_unknown(PATH, LAMBDAS, force_comps=FORCE_COMPS)

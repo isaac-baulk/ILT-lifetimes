@@ -527,7 +527,7 @@ def do_iterative_lasso_ILT(input_file, num_elements, lambdas,
     sigma = np.sqrt(np.maximum(raw_data, 1.0)) / scale_factor
 
     # Initially there are no exponential components
-    parameters = np.array([], dtype=float)
+    parameters = np.array([0.0], dtype=float)
 
     # Initial residual equals original data
     current_data = raw_data_scaled.copy()
@@ -580,14 +580,15 @@ def do_iterative_lasso_ILT(input_file, num_elements, lambdas,
 
         # Amplitudes >= 0
         # Relaxation rates between 0 and max(lambdas)
-        lower_bounds = np.tile(
-            [0.0, 0.0], iteration + 1
-        )
+        lower_bounds = np.r_[
+            0.0,
+            np.tile([0.0, 0.0], iteration + 1)
+        ]
 
-        upper_bounds = np.tile(
-            [np.inf, float(np.max(lambdas))],
-            iteration + 1
-        )
+        upper_bounds = np.r_[
+            np.inf,
+            np.tile([np.inf, float(np.max(lambdas))], iteration + 1)
+        ]
 
         # -----------------------------------------------
         # STEP 4: Globally refit ALL exponentials
@@ -632,13 +633,14 @@ def do_iterative_lasso_ILT(input_file, num_elements, lambdas,
 
         for k in range(iteration + 1):
 
-            A = parameters[2*k]
-            rate = parameters[2*k + 1]
+            A = parameters[1 + 2*k]
+            rate = parameters[2 + 2*k]
 
             print(
                 f"Component {k+1}: "
                 f"A = {A:.6f}, "
-                f"lambda = {rate:.6f}"
+                f"lambda = {rate:.6f}, "
+                f"lifetime = {1.0/(rate/1e3):.6f} ns"
             )
 
         # -----------------------------------------------
@@ -665,8 +667,8 @@ def do_iterative_lasso_ILT(input_file, num_elements, lambdas,
         # Show individual exponentials
         for k in range(iteration + 1):
 
-            A = parameters[2*k]
-            rate = parameters[2*k + 1]
+            A = parameters[1 + 2*k]
+            rate = parameters[2 + 2*k]
 
             component = A * np.exp(-rate * t)
 
@@ -858,14 +860,14 @@ def do_iterative_lasso_ILT(input_file, num_elements, lambdas,
 #     plot_optimal(t, raw_data_scaled, lambdas, cumulative_reconstruction, composite_dist_norm, all_element_data)
 if __name__ == "__main__":
 
-    input_file = 'data/81801-bwd-counts.dat'
+    input_file = 'data/mantid/81801-bwd-counts.dat'
 
     # Include lambda=0 to permit a constant exponential component
     lambdas = np.logspace(0.4, 20, 50)
 
     do_iterative_lasso_ILT(
         input_file,
-        num_elements=6,
+        num_elements=3,
         lambdas=lambdas,
         target_mawr=None
     )
