@@ -57,7 +57,7 @@ def perform_ILT_lasso(alpha, K, raw_data):
         alpha=alpha,
         positive=True,
         fit_intercept=False,
-        max_iter=100000
+        max_iter=1000
     )
 
     lasso.fit(K, raw_data)
@@ -221,7 +221,7 @@ def track_elemental_peaks_sweep(
     reference_rates=None,
     window_fraction=0.5,
     min_valid=3,
-    verbose=True,
+    verbose=False,
 ):
     """Track each component's ILT peak across the alpha sweep.
 

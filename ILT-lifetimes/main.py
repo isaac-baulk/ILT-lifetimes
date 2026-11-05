@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import re
 import numpy as np
-from scipy.optimize import lsq_linear, least_squares # Alex: add this import
+from scipy.optimize import linear_sum_assignment, lsq_linear, least_squares # Alex: add this import
 from scipy.signal import find_peaks
 
 from tikhonov_ILT_Alex import load_data
@@ -20,7 +20,6 @@ from iterative_ILT import do_iterative_lasso_ILT
 
 # ======================USER CONFIG==========================
 DF_PATH = "data/muon_capture_tables_III_IV.xlsx"
-FORMULA = "LiAlSi2O6"  # Example formula; replace with the desired chemical formula
 MU_RATE = 0.45516
 BG_FRAC = 0.0001
 DB = {"H", "O", "O-18", "Li-6", "Li-7", "F", "C", "C-13"}
@@ -137,7 +136,7 @@ def get_element_rates(elements_df, avg_df, df=None):
     out["rate_error"] = [e for _, e in resolved]
     return out
 
-def generate_synethtic_data(elements_df, avg_df):
+def generate_synthetic_data(elements_df, avg_df):
     """Generate synthetic data based on the elements' amplitudes and rates."""
     # 1. Calculate the total amplitude and normalize
     total_amplitude = elements_df['amplitude'].sum()
@@ -246,18 +245,32 @@ def fit_amplitudes_fixed_rates(t, data, errors, rate_samples):
         out.append(sol[1:])
     return np.asarray(out)
 
-
-def estimate_component_uncertainties(t, data, errors, parameters, lambdas, jac=None,
-                                     mev=None, num_bootstrap=200, seed=0):
-    """Alpha-sweep (systematic) + bootstrap (statistical) errors on the FINAL model.
-
-    parameters = [bg, A1, r1, A2, r2, ...] from the converged global fit.
-    """
+def get_components_from_fits(parameters):
     parameters = np.asarray(parameters, dtype=float)
     n_comp = (len(parameters) - 1) // 2
     if n_comp == 0:
         return {}
-    bg, amps, rates = parameters[0], parameters[1::2], parameters[2::2]
+    amps, rates = parameters[1::2], parameters[2::2]
+    comps = {}
+
+    for k in range(n_comp):
+        rate = rates[k]
+        A = amps[k]
+        tau = 1.0 / rate if rate > 0 else np.inf
+        comps[k+1] = {"amplitude": A, "rate": rate, "lifetime": tau}
+
+    return comps
+
+def get_component_uncertainties(t, data, errors, comps, parameters, lambdas, jac=None,
+                                     mev=None, num_bootstrap=50, seed=0):
+    """Alpha-sweep (systematic) + bootstrap (statistical) errors on the FINAL model.
+
+    parameters = [bg, A1, r1, A2, r2, ...] from the converged global fit.
+    """
+    bg = parameters[0]
+
+    n_comp = len(comps)
+    rates = np.array([comps[k+1]["rate"] for k in range(n_comp)], dtype=float)
 
     # --- systematic: alpha sweep on data that still contains ALL components ---
     ilt_data = data - bg
@@ -280,7 +293,6 @@ def estimate_component_uncertainties(t, data, errors, parameters, lambdas, jac=N
     if jac is not None:
         cov_std = np.sqrt(np.abs(np.diag(np.linalg.pinv(jac.T @ jac))))
 
-    comps = {}
     for k in range(n_comp):
         a_rate = sweep_res[k]["rate_std"]
         a_amp = sweep_res[k]["amplitude_std"]
@@ -302,18 +314,16 @@ def estimate_component_uncertainties(t, data, errors, parameters, lambdas, jac=N
         else:
             tau, tau_err = np.inf, 0.0
 
-        comps[k + 1] = {
-            "mev": mev, "amplitude": amps[k], "amplitude err": A_err,
-            "rate": rate, "rate err": rate_err,
-            "lifetime": tau, "lifetime err": tau_err,
-            "alpha rate err": a_rate, "bootstrap rate err": b_rate,
-        }
+        comps[k + 1]["mev"] = mev
+        comps[k + 1]["amplitude err"] = A_err
+        comps[k + 1]["rate err"] = rate_err
+        comps[k + 1]["lifetime err"] = tau_err
+        comps[k + 1]["alpha rate err"] = a_rate
+        comps[k + 1]["bootstrap rate err"] = b_rate
+        
     return comps
 
-def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_mawr=1.5, print_int=False, force_comps=None):
-    # use a forward modelling approach to iteratively add exponentials to the fit, using L1-regularized ILT to identify the next exponential to add
-
-    # Normalize data
+def scale_data_and_errors(raw_data, errors):
     scale_factor = np.max(raw_data)
     if scale_factor <= 0:
         raise ValueError("Data have no positive counts to fit")
@@ -323,21 +333,95 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
     zero_error_mask = (errors == 0)
     poisson_fallback = np.sqrt(np.maximum(raw_data, 1.0))
     safe_raw_errors = np.where(zero_error_mask, poisson_fallback, errors)
-    errors = safe_raw_errors / scale_factor
+    errors_scaled = safe_raw_errors / scale_factor
 
+    return raw_data_scaled, errors_scaled
+
+def plot_intermediate_fit(time_points, raw_data_scaled, fit, current_data, mawr, parameters, lambdas, ilt_dist, new_rate, peak_idx, mev, iteration):
+    fig, (ax1, ax2, ax3) = plt.subplots(
+        3, 1, figsize=(10, 9)
+    )
+
+    # Experimental data and global fit
+    ax1.plot(
+        time_points, raw_data_scaled,
+        '.', markersize=3,
+        label='Data'
+    )
+
+    ax1.plot(
+        time_points, fit,
+        '-', linewidth=2,
+        label='Global fit'
+    )
+
+    # Show individual exponentials
+    for k in range(iteration):
+
+        A = parameters[2*k]
+        rate = parameters[2*k + 1]
+
+        component = A * np.exp(-rate * time_points)
+
+        ax1.plot(
+            time_points, component,
+            '--', alpha=0.7,
+            label=f'Exponential {k+1}'
+        )
+
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('Scaled counts')
+    ax1.set_title(
+        f'Fit with {iteration + 1} exponentials'
+    )
+    ax1.legend()
+
+    # Signed residual
+    ax2.axhline(0, color='black', linewidth=0.8)
+    ax2.plot(time_points, current_data, '.', markersize=3)
+
+    ax2.set_xlabel('Time')
+    ax2.set_ylabel('Data - Fit')
+    ax2.set_title(f'Residual: MAWR = {mawr:.4f}')
+
+    # ILT distribution used to initialize this iteration
+    ax3.plot(
+        lambdas, ilt_dist,
+        label='ILT of previous residual'
+    )
+
+    ax3.plot(
+        new_rate,
+        ilt_dist[peak_idx],
+        'ro',
+        label='Selected peak'
+    )
+
+    ax3.set_xlabel('Relaxation rate')
+    ax3.set_xscale('symlog', linthresh=0.01)
+    ax3.set_ylabel('ILT amplitude')
+    ax3.legend()
+
+    plt.tight_layout()
+    plt.title(f'ILT at {mev} MEv')
+    plt.show()
+
+
+
+def do_iterative_lasso_ILT(time_points, raw_data_scaled, errors_scaled, mev, lambdas, target_mawr=1.5, print_int=False, force_comps=None):
+    # use a forward modelling approach to iteratively add exponentials to the fit, using L1-regularized ILT to identify the next exponential to add
 
     parameters = np.array([np.min(raw_data_scaled)], dtype=float)
     current_data = raw_data_scaled.copy()
     metric_history = [
-        np.mean(np.abs(current_data) / errors)
+        np.mean(np.abs(current_data) / errors_scaled)
     ]
 
-    found_components = {}
     last_jac = None
     iteration = 0
-
-    while (metric_history[-1] > target_mawr and iteration < 10) or (force_comps is not None and iteration < force_comps):
-        print(f'Beginning next iteration. Fitting {iteration + 1} exponentials')
+    print(f"Starting iterative ILT solver with target MAWR = {target_mawr:.4f} and force_comps = {force_comps}")
+    while (iteration < force_comps) if force_comps is not None else (metric_history[-1] > target_mawr and iteration < 10):
+        print(f'Beginning next iteration. Fitting {iteration+1} exponentials')
         # STEP 1: Perform ILT on the current residual
         ilt_input = current_data.copy()
         _, optimal_alpha, _, ilt_dist, _ = optimise_alpha_lasso(
@@ -367,10 +451,10 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         # STEP 4: Globally refit ALL exponentials
         result = least_squares(
             # The objective function
-            lambda p: (exponential_model(time_points, p) - raw_data_scaled) / errors,
+            lambda p: (exponential_model(time_points, p) - raw_data_scaled) / errors_scaled,
             
             # The analytical Jacobian (divided by errors to match the objective)
-            jac=lambda p: exponential_jacobian(time_points, p) / errors[:, None],
+            jac=lambda p: exponential_jacobian(time_points, p) / errors_scaled[:, None],
             
             x0=initial_guess,
             bounds=(lower_bounds, upper_bounds),
@@ -386,155 +470,163 @@ def do_iterative_lasso_ILT(time_points, raw_data, errors, mev, lambdas, target_m
         parameters = result.x
         fit = exponential_model(time_points, parameters)
         current_data = raw_data_scaled - fit
-        mawr = np.mean(np.abs(current_data) / errors)
+        mawr = np.mean(np.abs(current_data) / errors_scaled)
         metric_history.append(mawr)
 
         last_jac = result.jac
 
         iteration += 1
 
-    found_components = estimate_component_uncertainties(
-        time_points, raw_data_scaled, errors, parameters, lambdas,
-        jac=last_jac if iteration > 0 else None, mev=mev,
-    )
-
-
     # -----------------------------------------------
     # STEP 6: Display the results
     # -----------------------------------------------
     if print_int:
-        fig, (ax1, ax2, ax3) = plt.subplots(
-            3, 1, figsize=(10, 9)
+        plot_intermediate_fit(
+            time_points, raw_data_scaled, fit, current_data, mawr, parameters, lambdas, ilt_dist, new_rate, peak_idx, mev, iteration
         )
 
-        # Experimental data and global fit
-        ax1.plot(
-            time_points, raw_data_scaled,
-            '.', markersize=3,
-            label='Data'
-        )
-
-        ax1.plot(
-            time_points, fit,
-            '-', linewidth=2,
-            label='Global fit'
-        )
-
-        # Show individual exponentials
-        for k in range(iteration):
-
-            A = parameters[2*k]
-            rate = parameters[2*k + 1]
-
-            component = A * np.exp(-rate * time_points)
-
-            ax1.plot(
-                time_points, component,
-                '--', alpha=0.7,
-                label=f'Exponential {k+1}'
-            )
-
-        ax1.set_xlabel('Time')
-        ax1.set_ylabel('Scaled counts')
-        ax1.set_title(
-            f'Fit with {iteration + 1} exponentials'
-        )
-        ax1.legend()
-
-        # Signed residual
-        ax2.axhline(0, color='black', linewidth=0.8)
-        ax2.plot(time_points, current_data, '.', markersize=3)
-
-        ax2.set_xlabel('Time')
-        ax2.set_ylabel('Data - Fit')
-        ax2.set_title(f'Residual: MAWR = {mawr:.4f}')
-
-        # ILT distribution used to initialize this iteration
-        ax3.plot(
-            lambdas, ilt_dist,
-            label='ILT of previous residual'
-        )
-
-        ax3.plot(
-            new_rate,
-            ilt_dist[peak_idx],
-            'ro',
-            label='Selected peak'
-        )
-
-        ax3.set_xlabel('Relaxation rate')
-        ax3.set_xscale('symlog', linthresh=0.01)
-        ax3.set_ylabel('ILT amplitude')
-        ax3.legend()
-
-        plt.tight_layout()
-        plt.title(f'ILT at {mev} MEv')
-        plt.show()
-
-    return found_components, np.asarray(metric_history)
-
-def determine_stoichemtry(elements_df):
-    """Determine stoichiometry of compound based on amplitudes of components found by the ILT solver."""
-    pass
+    return parameters, last_jac if iteration > 0 else None
 
 
-def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df, target_mawr=0.8):
+def determine_required_mev(pure_signal_counts, time_points, lambdas, elements_df, target_mawr=0.8, force_comps=None):
     """
-    Sweeps MEv up to a strict limit of 50.0. 
     Maps found rates to theoretical elements to determine if they are resolved or grouped.
     """
-    mev_steps = [1.0, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0]
+    mev_steps = [1 * (2**i) for i in range(20)]
     
     print("\n--- Determining Required MEv for Resolution ---")
+    success = False
+    comps = {}
+    groupings = {}
     
     for mev in mev_steps:
         print(f"\nTesting {mev:.1f} MEv... ==================================")
         noisy_counts, errors = scale_and_noise(pure_signal_counts, time_points, mev)
         
         # Run the iterative ILT solver
-        found_components, _ = do_iterative_lasso_ILT(
+        parameters, last_jac = do_iterative_lasso_ILT(
             time_points, noisy_counts, errors, mev,
             lambdas=lambdas,
             target_mawr=target_mawr,
+            force_comps=force_comps
+        )
+
+        comps = get_components_from_fits(parameters)
+        
+        found_rates = np.asarray(
+            [data["rate"] for data in comps.values()],
+            dtype=float,
         )
         
-        found_rates = [data['rate'] for data in found_components.values()]
-        
-        if not found_rates:
+        if len(found_rates) == 0:
             print("Solver failed to find components.")
             continue
-            
-        # Map each theoretical element to the closest rate found by the solver
-        groupings = {fr: [] for fr in found_rates}
-        for _, row in elements_df.iterrows():
-            closest_rate = min(found_rates, key=lambda x: abs(x - row['rate']))
-            groupings[closest_rate].append(row['element'])
-        
-        # Check if any found component is forced to represent multiple theoretical elements
-        has_grouped_factor = any(len(elements) > 1 for elements in groupings.values())
-        
-        if not has_grouped_factor:
-            print(f"\nSUCCESS: All elements cleanly separated at {mev:.1f} MEv.")
-            for fr, elements in groupings.items():
-                if elements:
-                    print(f"  {elements[0]} isolated at rate = {fr:.4f} us^-1 and lifetime = {(1.0 / fr) * 10e2 if fr > 0 else np.inf:.2f} us")
-                    print(f"  {elements[0]} isolated at rate = {fr:.4f} us^-1 and lifetime = {lifetime:.2f} us")
-            return mev, found_components
 
-    # If the loop finishes without returning, the 50 MEv limit was reached
-    print("\nLIMIT REACHED: Solver cannot fully separate components at 50.0 MEv.")
+        if len(found_rates) != len(elements_df):
+            print(
+                f"Found {len(found_rates)} components, but expected "
+                f"{len(elements_df)}."
+            )
+            continue
+
+        comps = get_component_uncertainties(
+            time_points, noisy_counts, errors, comps, parameters, lambdas,
+            jac=last_jac if last_jac is not None else None,
+            mev=mev
+        )
+        found_rate_errors = np.asarray(
+            [data["rate err"] for data in comps.values()],
+            dtype=float,
+        )
+        found_amplitudes = np.asarray(
+            [data["amplitude"] for data in comps.values()],
+            dtype=float,
+        )
+
+        theoretical_rates = elements_df["rate"].to_numpy(dtype=float)
+        theoretical_amplitudes = elements_df["amplitude"].to_numpy(dtype=float)
+        amplitude_differences = np.abs(
+            theoretical_amplitudes[:, None] - found_amplitudes[None, :]
+        )
+        assignment_rows, assignment_cols = linear_sum_assignment(
+            amplitude_differences
+        )
+
+        rate_differences = np.abs(
+            theoretical_rates[:, None] - found_rates[None, :]
+        )
+        within_found_error = (
+            rate_differences <= found_rate_errors[None, :]
+        )
+        matched_within_error = np.all(
+            within_found_error[assignment_rows, assignment_cols]
+        )
+
+        rate_intervals_are_separate = True
+        for component_index, (found_rate, rate_error) in enumerate(
+            zip(found_rates, found_rate_errors)
+        ):
+            interval_min = found_rate - rate_error
+            interval_max = found_rate + rate_error
+            other_theoretical_rates = np.delete(
+                theoretical_rates,
+                assignment_rows[assignment_cols == component_index],
+            )
+            other_found_rates = np.delete(found_rates, component_index)
+            if np.any(
+                (other_theoretical_rates >= interval_min)
+                & (other_theoretical_rates <= interval_max)
+            ) or np.any(
+                (other_found_rates >= interval_min)
+                & (other_found_rates <= interval_max)
+            ):
+                rate_intervals_are_separate = False
+                break
+
+        matched_within_error = (
+            matched_within_error and rate_intervals_are_separate
+        )
+
+        groupings = {
+            found_rates[col]: [elements_df.iloc[row]["element"]]
+            for row, col in zip(assignment_rows, assignment_cols)
+        }
+
+        if matched_within_error:
+            print(f"\nSUCCESS: All theoretical rates matched at {mev:.1f} MEv.")
+            for row, col in zip(assignment_rows, assignment_cols):
+                found_rate = found_rates[col]
+                theoretical_rate = theoretical_rates[row]
+                print(
+                    f"  {elements_df.iloc[row]['element']}: "
+                    f"amplitude {found_amplitudes[col]:.4f}, "
+                    f"found {found_rate:.4f} us^-1, "
+                    f"expected {theoretical_rate:.4f} us^-1, "
+                    f"solver error +/- {found_rate_errors[col]:.4f} us^-1"
+                )
+            success = True
+            return mev, comps, success
+
+        if not matched_within_error:
+            print(
+                "Found rates are not sufficiently separated or do not "
+                "match all theoretical rates within solver error."
+            )
+
+    # If the loop finishes without returning, the MEv limit was reached
+    print(f"\nLIMIT REACHED: Solver cannot fully separate components at {mev:.1f} MEv.")
     print("The following components are definitively Grouped Factors:")
     for fr, elements in groupings.items():
         if len(elements) > 1:
             print(f"  -> GROUPED FACTOR: {', '.join(elements)} (Effective Rate: {fr:.4f} us^-1)")
             lifetime = (1.0 / fr) * 10e2 if fr > 0 else np.inf
-            print(f"    Predicted lifetime: {lifetime:.2f} us")
+            print(f"    Predicted lifetime: {lifetime:.2f} ns")
         elif len(elements) == 1:
             print(f"  -> Separated: {elements[0]} (Rate: {fr:.4f} us^-1)")
-            
-    return 50.0, found_components
+    success = False        
+    return mev_steps[-1], comps, success
 
-def check_resolution_limits(elements_df, resolution_ratio=1.15):
+def check_resolution_limits(elements_df, resolution_ratio=1.5):
     """
     Checks if theoretical decay rates are too close to be resolved by the solver
     and predicts the amplitude-weighted grouped rates.
@@ -598,35 +690,46 @@ def compare_to_true_lifetimes(found_components, elements_df):
         print(f"Percentage Difference in Lifetime: {abs(found_lifetime - closest_lifetime) / closest_lifetime * 100:.2f}%\n")
         print(f"Other elements in error range:")
         for other_element in elements_df.itertuples():
+            if other_element.element == closest_element.element:
+                continue
             other_lifetime = (1.0 / other_element.rate) * 10e2 if other_element.rate > 0 else np.inf
-            if abs(found_lifetime - other_lifetime) <= lifetime_error:
+            if abs(found_lifetime - other_lifetime) <= lifetime_error and other_element.element != closest_element.element:
                 print(f"  - {other_element.element}: Theoretical Lifetime = {other_lifetime:.2f} us")
     
     print("-------------------------------------------\n")
 
-def find_required_res():
+def find_required_res(FORMULA, CONSTITUENTS, CONCS, force_comps=None):
     #parsed_formula = parse_formula_isotopes(FORMULA, available=DB)
-    parsed_formula = chemparse.parse_formula(FORMULA)
+    if FORMULA:
+        parsed_formula = parse_formula_isotopes(FORMULA, available=DB)
+    elif CONSTITUENTS and CONCS:
+        ratios = np.array(CONCS) / np.min(CONCS)
+        parsed_formula = {c: conc for c, conc in zip(CONSTITUENTS, ratios)}
+    else:
+        raise ValueError("Either FORMULA or both CONSTITUENTS and CONCS must be provided.")
     elements_df = pd.DataFrame(list(parsed_formula.items()), columns=['element', 'count'])
     df, avg_df = read_and_clean_data()
     elements_df = get_element_amplitudes(elements_df, avg_df, df)
     elements_df = get_element_rates(elements_df, avg_df, df)
 
     time_points, lambdas = generate_dynamic_grids(elements_df)
-    pure_signal_counts, synthetic_data, time_points = generate_synethtic_data(elements_df, avg_df)
+    pure_signal_counts, synthetic_data, time_points = generate_synthetic_data(elements_df, avg_df)
 
     plot_data(synthetic_data, pure_signal_counts, time_points)
+    check_resolution_limits(elements_df, resolution_ratio=1.15)
 
     # run sim
-    required_mev, final_components = determine_required_mev(
+    required_mev, final_components, success = determine_required_mev(
         pure_signal_counts, 
         time_points,
         lambdas, 
         elements_df, 
-        target_mawr=0.8  # Lower threshold to force the solver to try splitting elements
+        target_mawr=0.8,  # Lower threshold to force the solver to try splitting elements
+        force_comps=force_comps
     )
 
-    compare_to_true_lifetimes(final_components, elements_df)
+    if success:
+        compare_to_true_lifetimes(final_components, elements_df)
 
 def perform_ILT_on_unknown(PATH, lambdas, force_comps=None):
     time_points, raw_data, errors = load_data(PATH)
@@ -635,12 +738,22 @@ def perform_ILT_on_unknown(PATH, lambdas, force_comps=None):
     ev = np.sum(raw_data)
     mev = ev / 1e6
 
-    found_components, metric_history = do_iterative_lasso_ILT(
-        time_points, raw_data, errors, mev=mev,
+    raw_data_scaled, errors_scaled = scale_data_and_errors(raw_data, errors)
+
+    parameters, last_jac, iteration = do_iterative_lasso_ILT(
+        time_points, raw_data_scaled, errors_scaled,
+        mev=mev,
         lambdas=lambdas,
         target_mawr=1.5,
         print_int=False,
         force_comps=force_comps
+    )
+
+    found_components = get_components_from_fits(parameters)
+    found_components = get_component_uncertainties(
+        time_points, raw_data_scaled, errors_scaled, found_components, parameters, lambdas,
+        jac=last_jac if last_jac is not None else None,
+        mev=mev
     )
 
     #reconstruct the decay curves for each found component
@@ -659,10 +772,15 @@ def perform_ILT_on_unknown(PATH, lambdas, force_comps=None):
 
 
 if __name__ == "__main__":
-    #find_required_res()
-    PATH = "data/mantid/81799-bwd-counts.dat"  # Replace with the actual path to your unknown data file
+
+    PATH = "data/mantid/81256-bwd-counts.dat"  # Replace with the actual path to your unknown data file
     LAMBDAS = np.linspace(0.01, 10.0, 250)  # Adjust the lambda grid as needed
     FORCE_COMPS = 2
 
+    #fill in either formula OR consituents and concentrations
+    FORMULA = None  # Example formula; replace with the desired chemical formula
+    CONSTITUENTS = ["Fe", "Ni"]
+    CONCS = [0.1, 0.9]  # sum to 1
 
-    perform_ILT_on_unknown(PATH, LAMBDAS, force_comps=FORCE_COMPS)
+    find_required_res(FORMULA, CONSTITUENTS, CONCS, force_comps=FORCE_COMPS)
+    #perform_ILT_on_unknown(PATH, LAMBDAS, force_comps=FORCE_COMPS)
